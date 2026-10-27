@@ -66,9 +66,25 @@ func test_thread_inherits_mask():
     mem.Free(set)
 end
 
+func test_set_membership():
+    set := signal.NewSet()
+    testing.AssertTrue(set != null)
+    _ := signal.AddSignal(set, signal.WinchSignal)
+    // 15 is SIGTERM on every target, unlike the SIGWINCH number.
+    _ := signal.AddSignal(set, 15)
+    testing.AssertTrue(signal.IsSignal(set, signal.WinchSignal))
+    testing.AssertTrue(signal.IsSignal(set, 15))
+    // SIGHUP (1) was never added.
+    testing.AssertTrue(not signal.IsSignal(set, 1))
+    testing.AssertTrue(signal.DelSignal(set, signal.WinchSignal))
+    testing.AssertTrue(not signal.IsSignal(set, signal.WinchSignal))
+    mem.Free(set)
+end
+
 func main:
     test_supported()
     test_blocked_self_signal_is_consumed()
     test_thread_inherits_mask()
+    test_set_membership()
     ret testing.Summary()
 end
