@@ -99,7 +99,7 @@ end
 
 | Name | Purpose |
 |---|---|
-| `SignalSetSize` | Bytes in a platform signal set: 4 on macOS and OpenBSD, 16 on FreeBSD, NetBSD and DragonFly, 128 on Linux, 0 on Windows |
+| `SignalSetSize` | Bytes in a platform signal set: 4 on macOS and OpenBSD, 16 on FreeBSD and NetBSD, 128 on Linux, 0 on Windows |
 | `NewSet` | Allocate an empty caller-owned set |
 | `FillSet` | Add every signal to a set |
 | `AddSignal` | Add one signal number; false when the number is invalid or unsupported |
@@ -110,8 +110,8 @@ end
 | `SetMask` | Replace the calling thread's mask with the set |
 
 CI builds and tests macOS and Linux only, so the BSD values and the Windows
-stubs are not exercised by CI. The signal-set API is on `main` and not in the
-`v0.1.0` tag; it ships in the next release.
+stubs are not exercised by CI; DragonFly is not a Salam target. The signal-set
+API is on `main` and not in the `v0.1.0` tag; it ships in the next release.
 
 ## Contributing
 
