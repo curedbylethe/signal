@@ -30,13 +30,14 @@
  * thread and must stay async-signal-safe. No sigtimedwait (absent on macOS)
  * and no SIGALRM timeouts. Sets are built and edited by libc's sigemptyset,
  * sigfillset, sigaddset, sigdelset and sigismember. On Darwin those names are
- * C macros at sys/signal.h:116-126 shadowing the prototypes at 89-97; the
+ * C macros at signal.h:116-126 shadowing the prototypes at 89-97; the
  * real symbols (_sigemptyset, _sigfillset, _sigaddset, _sigdelset,
  * _sigismember) are ordinary libSystem exports, and a non-C extern binds the
  * symbol rather than expanding the macro. A probe on macOS 27.0.1 arm64
  * measured all five linking and running and sizeof(sigset_t) at 4. The size
- * is not universal: 4 on OpenBSD, 16 on FreeBSD, NetBSD and DragonFly, 128 on
- * Linux. Windows is a stub surface — there is no SIGWINCH and no sigset_t, so
+ * is not universal: 4 on OpenBSD, 16 on FreeBSD and NetBSD, 128 on Linux.
+ * DragonFly has no Salam target, so no build selects a size for it. Windows
+ * is a stub surface — there is no SIGWINCH and no sigset_t, so
  * every function is safe to call and WinchSupported reports false so callers
  * can fall back to polling.
  *
@@ -76,7 +77,8 @@ end
 /// the watch is enabled on.
 pub const WinchSignal := 28
 
-// sizeof(sigset_t): Darwin sys/_types/_sigset_t.h, OpenBSD sys/signal.h, FreeBSD/DragonFly sys/_sigset.h, NetBSD sys/sigtypes.h, Linux sigset headers.
+// sizeof(sigset_t): Darwin sys/_types/_sigset_t.h, OpenBSD sys/signal.h, FreeBSD sys/_sigset.h, NetBSD sys/sigtypes.h, Linux sigset headers.
+// MAC and OPENBSD must precede BSD, which also matches them.
 if SALAM_OS_WINDOWS:
     @en "SignalSetSize"
     /// 0: signal sets do not exist on Windows, where the set functions are
@@ -84,15 +86,15 @@ if SALAM_OS_WINDOWS:
     pub const SignalSetSize := 0
 else SALAM_OS_MAC:
     @en "SignalSetSize"
-    /// 4 bytes, the Darwin sigset_t. Must precede the generic BSD branch.
+    /// 4 bytes, the Darwin sigset_t.
     pub const SignalSetSize := 4
 else SALAM_OS_OPENBSD:
     @en "SignalSetSize"
-    /// 4 bytes, the OpenBSD sigset_t. Must precede the generic BSD branch.
+    /// 4 bytes, the OpenBSD sigset_t.
     pub const SignalSetSize := 4
 else SALAM_OS_BSD:
     @en "SignalSetSize"
-    /// 16 bytes, the FreeBSD, NetBSD and DragonFly sigset_t.
+    /// 16 bytes, the FreeBSD and NetBSD sigset_t.
     pub const SignalSetSize := 16
 else:
     @en "SignalSetSize"
@@ -142,13 +144,9 @@ end
 /// Allocate a signal set containing SIGWINCH and nothing else. The caller
 /// owns the memory and releases it with mem.Free. Returns null on Windows.
 pub func NewWinchSet(): void*:
-    if SALAM_OS_WINDOWS:
-        ret null
-    else:
-        set := NewSet()
-        _ := AddSignal(set, WinchSignal)
-        ret set
-    end
+    set := NewSet()
+    _ := AddSignal(set, WinchSignal)
+    ret set
 end
 
 @en "InstallWinchHandler"
@@ -174,7 +172,6 @@ pub func BlockWinch():
         ret
     else:
         set := NewWinchSet()
-        if set == null: ret end
         Block(set)
         mem.Free(set)
     end
@@ -221,6 +218,7 @@ pub func NewSet(): void*:
     else:
         set := mem.AllocateZeroed(SignalSetSize as u64)
         if set == null: ret null end
+        // Fails only on a null set, guarded above.
         _ := sigemptyset(set)
         ret set
     end
@@ -234,6 +232,7 @@ pub func FillSet(set: void*):
         ret
     else:
         if set == null: ret end
+        // Fails only on a null set, guarded above.
         _ := sigfillset(set)
     end
 end
@@ -284,6 +283,7 @@ pub func Block(set: void*):
         ret
     else:
         if set == null: ret end
+        // Fails only on a bad how; _SIG_BLOCK is fixed per platform above.
         _ := sigprocmask(_SIG_BLOCK, set, null)
     end
 end
@@ -296,6 +296,7 @@ pub func Unblock(set: void*):
         ret
     else:
         if set == null: ret end
+        // Fails only on a bad how; _SIG_UNBLOCK is fixed per platform above.
         _ := sigprocmask(_SIG_UNBLOCK, set, null)
     end
 end
@@ -308,6 +309,7 @@ pub func SetMask(set: void*):
         ret
     else:
         if set == null: ret end
+        // Fails only on a bad how; _SIG_SETMASK is fixed per platform above.
         _ := sigprocmask(_SIG_SETMASK, set, null)
     end
 end
