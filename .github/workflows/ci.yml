@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: SalamLang/Salam/.github/actions/setup-salam@d5e0c093c7e0d978bc5eae404fdeed4755d581d9  # v0.5.9
+        with:
+          version: '0.5.9'
+      - run: salam version
+      - run: make check
+      - run: make test-llvm
