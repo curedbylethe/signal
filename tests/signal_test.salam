@@ -69,8 +69,9 @@ end
 func test_set_membership():
     set := signal.NewSet()
     testing.AssertTrue(set != null)
+    testing.AssertTrue(not signal.AddSignal(set, 0))
     _ := signal.AddSignal(set, signal.WinchSignal)
-    // 15 is SIGTERM on every target, unlike the SIGWINCH number.
+    // 15 is SIGTERM on every target.
     _ := signal.AddSignal(set, 15)
     testing.AssertTrue(signal.IsSignal(set, signal.WinchSignal))
     testing.AssertTrue(signal.IsSignal(set, 15))
