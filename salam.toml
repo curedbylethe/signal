@@ -1,5 +1,5 @@
 [package]
 name = "signal"
-version = "0.1.0"
+version = "0.1.1"
 salam = ">=0.5.9"
 kind = "lib"
