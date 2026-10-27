@@ -27,9 +27,9 @@ salam add github.com/curedbylethe/signal@v0.1.0
 ## Usage
 
 ```salam
-import "github.com/curedbylethe/signal"
-
 import mem
+
+import "github.com/curedbylethe/signal"
 
 func main:
     if not signal.WinchSupported():
