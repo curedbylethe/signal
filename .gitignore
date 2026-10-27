@@ -1,0 +1,5 @@
+build/
+.salam-build/
+.DS_Store
+.agents/
+.claude/
