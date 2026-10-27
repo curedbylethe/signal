@@ -1,0 +1,174 @@
+/*
+ * signal - POSIX signal primitives for Salam (2026)
+ *
+ * Salam: https://github.com/SalamLang/Salam
+ *
+ * Repository: https://github.com/curedbylethe/signal
+ * License: GPL-3.0-or-later
+ *
+ */
+
+/*
+ * Signal: POSIX signal plumbing, extracted from basalam's resize watcher.
+ *
+ * A terminal reports a resize out of band as SIGWINCH, and waiting for that
+ * signal is cheaper than polling the size. This package owns the process-wide
+ * half of that job: InstallWinchHandler gives SIGWINCH a disposition,
+ * BlockWinch keeps it queued instead of delivering it on an arbitrary thread,
+ * and WaitWinch parks a thread until one arrives. Policy is not here: when to
+ * start watching and what a wake-up means belong to the caller.
+ *
+ * The handler is a deliberate no-op. It exists only to keep the disposition
+ * away from SIG_DFL: Darwin discards a blocked signal at generation when its
+ * disposition is the default, so without an installed handler a self- or
+ * terminal-raised SIGWINCH would vanish and sigwait would park forever. The
+ * signal number carries no information (SIGWINCH only means "the size may
+ * have changed"), so the handler has nothing to record and the caller
+ * re-reads the state after every wake-up.
+ *
+ * Deliberate non-goals. No handler body: the handler runs on the delivery
+ * thread and must stay async-signal-safe. No sigtimedwait (absent on macOS)
+ * and no SIGALRM timeouts. No sigaddset/sigemptyset calls: the mask is built
+ * by hand from the sigset_t bit layout. Windows is a stub surface — there is
+ * no SIGWINCH, so every function is safe to call and WinchSupported reports
+ * false so callers can fall back to polling.
+ *
+ * Seven public names, not six: WinchSignal, WinchSupported, NewWinchSet,
+ * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch.
+ */
+
+package signal
+
+// mem is imported only on POSIX. Every use of it lives in the POSIX halves
+// of the platform branches below; on Windows those halves are not compiled
+// and an import nothing uses is an error (E082), so the import has to go
+// away with them.
+if not SALAM_OS_WINDOWS:
+    import mem
+end
+
+if not SALAM_OS_WINDOWS:
+    extern:
+        func signal(sig: int, handler: void*): void*
+        func sigprocmask(how: int, set: void*, old: void*): int
+        func sigwait(set: void*, sig: void*): int
+        func kill(pid: int, sig: int): int
+        func getpid(): int
+    end
+end
+
+@en "WinchSignal"
+/// The SIGWINCH number. It is 28 on macOS and Linux, the only platforms
+/// the watch is enabled on.
+pub const WinchSignal := 28
+
+if not SALAM_OS_WINDOWS:
+    export:
+        func winch_noop(_sig: int):
+            // Deliberate no-op, kept async-signal-safe. It exists only to
+            // give SIGWINCH a non-default disposition; the argument is the
+            // signal number and carries no information (see the module
+            // comment). The discard keeps the body non-empty as the
+            // compiler requires without doing any work.
+            _ := _sig
+        end
+    end
+end
+
+@en "WinchSupported"
+/// True when this process can receive SIGWINCH, i.e. on POSIX. Windows has
+/// no SIGWINCH, so the watcher must not start there and callers should poll
+/// the terminal size instead.
+pub func WinchSupported(): bool:
+    if SALAM_OS_WINDOWS:
+        ret false
+    else:
+        ret true
+    end
+end
+
+@en "NewWinchSet"
+/// Allocate a zeroed signal set containing SIGWINCH and nothing else. The
+/// caller owns the memory and releases it with mem.Free. The mask is built
+/// by setting bit 27 of the first 32-bit word by hand (1 << 27), where
+/// sigaddset would put it. The
+/// same word layout is correct for the 32-bit Darwin sigset_t and the
+/// 128-byte glibc one. Returns null on Windows.
+pub func NewWinchSet(): void*:
+    if SALAM_OS_WINDOWS:
+        ret null
+    else:
+        set := mem.AllocateZeroed(128 as u64)
+        sp := set as i32*
+        sp[0] = 0x08000000
+        ret set
+    end
+end
+
+@en "InstallWinchHandler"
+/// Install the process-wide no-op SIGWINCH handler. Call this before
+/// BlockWinch: a signal blocked while its disposition is still SIG_DFL is
+/// discarded at generation on Darwin, so the handler must exist first. A
+/// no-op on Windows.
+pub func InstallWinchHandler():
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        _ := signal(WinchSignal, &winch_noop)
+    end
+end
+
+@en "BlockWinch"
+/// Add SIGWINCH to the calling thread's signal mask so the signal is queued
+/// for WaitWinch instead of delivered on an arbitrary thread. Threads
+/// spawned afterwards inherit the mask, which is what lets one dedicated
+/// watcher thread own the wait. A no-op on Windows.
+pub func BlockWinch():
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        set := NewWinchSet()
+        if set == null: ret end
+        // The SIG_BLOCK value of sigprocmask is not portable: Darwin and
+        // the BSDs use 1, Linux uses 0. The wrong value turns the block
+        // into an unblock, so resolve it per platform here rather than
+        // sharing a single constant.
+        mut how := 0
+        if SALAM_OS_MAC or SALAM_OS_BSD:
+            how = 1
+        end
+        _ := sigprocmask(how, set, null)
+        mem.Free(set)
+    end
+end
+
+@en "WaitWinch"
+/// Block the calling thread until a SIGWINCH is queued, then return its
+/// signal number. The set must contain SIGWINCH, as NewWinchSet builds, and
+/// the thread must have it blocked, as BlockWinch does. Returns 0 on
+/// Windows, or when set is null, so callers can treat 0 as "nothing to do".
+pub func WaitWinch(set: void*): int:
+    if SALAM_OS_WINDOWS:
+        ret 0
+    else:
+        if set == null: ret 0 end
+        sig := mem.AllocateZeroed(8 as u64)
+        _ := sigwait(set, sig)
+        n := (sig as i32*)[0]
+        mem.Free(sig)
+        ret n
+    end
+end
+
+@en "WakeWinch"
+/// Send SIGWINCH to this process so a thread parked in WaitWinch wakes up.
+/// With the signal blocked this only queues it, which is exactly what the
+/// watcher consumes; Screen uses it to break the wait when shutting down. A
+/// no-op on Windows.
+pub func WakeWinch():
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        _ := kill(getpid(), WinchSignal)
+    end
+end
