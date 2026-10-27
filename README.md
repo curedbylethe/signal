@@ -8,7 +8,7 @@ plumbing extracted from
 The package owns the process-wide handler and the blocked signal mask, and
 nothing else: no terminal state, no policy, no widget code.
 
-> **Status: 0.1.0, early development.** The `SIGWINCH` API is a
+> **Status: 0.1.1, early development.** The `SIGWINCH` API is a
 > behaviour-identical move of `basalam/signal.salam`; the signal-set API is new.
 > Hardening is tracked separately.
 
@@ -23,7 +23,7 @@ You need the Salam compiler, version 0.5.9 or later:
 Add signal with Salam's package manager:
 
 ```sh
-salam add github.com/curedbylethe/signal@v0.1.0
+salam add github.com/curedbylethe/signal@v0.1.1
 ```
 
 ## Usage
@@ -111,7 +111,7 @@ end
 
 CI builds and tests macOS and Linux only, so the BSD values and the Windows
 stubs are not exercised by CI; DragonFly is not a Salam target. The signal-set
-API is on `main` and not in the `v0.1.0` tag; it ships in the next release.
+API is part of `v0.1.1`.
 
 ## Contributing
 
