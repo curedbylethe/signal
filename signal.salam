@@ -28,13 +28,22 @@
  *
  * Deliberate non-goals. No handler body: the handler runs on the delivery
  * thread and must stay async-signal-safe. No sigtimedwait (absent on macOS)
- * and no SIGALRM timeouts. No sigaddset/sigemptyset calls: the mask is built
- * by hand from the sigset_t bit layout. Windows is a stub surface — there is
- * no SIGWINCH, so every function is safe to call and WinchSupported reports
- * false so callers can fall back to polling.
+ * and no SIGALRM timeouts. Sets are built and edited by libc's sigemptyset,
+ * sigfillset, sigaddset, sigdelset and sigismember. On Darwin those names are
+ * C macros at sys/signal.h:116-126 shadowing the prototypes at 89-97; the
+ * real symbols (_sigemptyset, _sigfillset, _sigaddset, _sigdelset,
+ * _sigismember) are ordinary libSystem exports, and a non-C extern binds the
+ * symbol rather than expanding the macro. A probe on macOS 27.0.1 arm64
+ * measured all five linking and running and sizeof(sigset_t) at 4. The size
+ * is not universal: 4 on OpenBSD, 16 on FreeBSD, NetBSD and DragonFly, 128 on
+ * Linux. Windows is a stub surface — there is no SIGWINCH and no sigset_t, so
+ * every function is safe to call and WinchSupported reports false so callers
+ * can fall back to polling.
  *
- * Seven public names, not six: WinchSignal, WinchSupported, NewWinchSet,
- * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch.
+ * Two public surfaces. SIGWINCH: WinchSignal, WinchSupported, NewWinchSet,
+ * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch. Signal sets:
+ * SignalSetSize, NewSet, FillSet, AddSignal, DelSignal, IsSignal, Block,
+ * Unblock, SetMask.
  */
 
 package signal
@@ -51,6 +60,11 @@ if not SALAM_OS_WINDOWS:
     extern:
         func signal(sig: int, handler: void*): void*
         func sigprocmask(how: int, set: void*, old: void*): int
+        func sigemptyset(set: void*): int
+        func sigfillset(set: void*): int
+        func sigaddset(set: void*, sig: int): int
+        func sigdelset(set: void*, sig: int): int
+        func sigismember(set: void*, sig: int): int
         func sigwait(set: void*, sig: void*): int
         func kill(pid: int, sig: int): int
         func getpid(): int
@@ -61,6 +75,43 @@ end
 /// The SIGWINCH number. It is 28 on macOS and Linux, the only platforms
 /// the watch is enabled on.
 pub const WinchSignal := 28
+
+// sizeof(sigset_t): Darwin sys/_types/_sigset_t.h, OpenBSD sys/signal.h, FreeBSD/DragonFly sys/_sigset.h, NetBSD sys/sigtypes.h, Linux sigset headers.
+if SALAM_OS_WINDOWS:
+    @en "SignalSetSize"
+    /// 0: signal sets do not exist on Windows, where the set functions are
+    /// inert stubs.
+    pub const SignalSetSize := 0
+else SALAM_OS_MAC:
+    @en "SignalSetSize"
+    /// 4 bytes, the Darwin sigset_t. Must precede the generic BSD branch.
+    pub const SignalSetSize := 4
+else SALAM_OS_OPENBSD:
+    @en "SignalSetSize"
+    /// 4 bytes, the OpenBSD sigset_t. Must precede the generic BSD branch.
+    pub const SignalSetSize := 4
+else SALAM_OS_BSD:
+    @en "SignalSetSize"
+    /// 16 bytes, the FreeBSD, NetBSD and DragonFly sigset_t.
+    pub const SignalSetSize := 16
+else:
+    @en "SignalSetSize"
+    /// 128 bytes, the glibc and musl sigset_t.
+    pub const SignalSetSize := 128
+end
+
+// SIG_BLOCK, SIG_UNBLOCK and SIG_SETMASK: sys/signal.h on Darwin and the
+// BSDs, bits/sigaction.h in glibc and musl. The wrong value turns a block
+// into an unblock, so each is a named constant.
+if SALAM_OS_BSD:
+    const _SIG_BLOCK := 1
+    const _SIG_UNBLOCK := 2
+    const _SIG_SETMASK := 3
+else:
+    const _SIG_BLOCK := 0
+    const _SIG_UNBLOCK := 1
+    const _SIG_SETMASK := 2
+end
 
 if not SALAM_OS_WINDOWS:
     export:
@@ -88,19 +139,14 @@ pub func WinchSupported(): bool:
 end
 
 @en "NewWinchSet"
-/// Allocate a zeroed signal set containing SIGWINCH and nothing else. The
-/// caller owns the memory and releases it with mem.Free. The mask is built
-/// by setting bit 27 of the first 32-bit word by hand (1 << 27), where
-/// sigaddset would put it. The
-/// same word layout is correct for the 32-bit Darwin sigset_t and the
-/// 128-byte glibc one. Returns null on Windows.
+/// Allocate a signal set containing SIGWINCH and nothing else. The caller
+/// owns the memory and releases it with mem.Free. Returns null on Windows.
 pub func NewWinchSet(): void*:
     if SALAM_OS_WINDOWS:
         ret null
     else:
-        set := mem.AllocateZeroed(128 as u64)
-        sp := set as i32*
-        sp[0] = 0x08000000
+        set := NewSet()
+        _ := AddSignal(set, WinchSignal)
         ret set
     end
 end
@@ -129,15 +175,7 @@ pub func BlockWinch():
     else:
         set := NewWinchSet()
         if set == null: ret end
-        // The SIG_BLOCK value of sigprocmask is not portable: Darwin and
-        // the BSDs use 1, Linux uses 0. The wrong value turns the block
-        // into an unblock, so resolve it per platform here rather than
-        // sharing a single constant.
-        mut how := 0
-        if SALAM_OS_MAC or SALAM_OS_BSD:
-            how = 1
-        end
-        _ := sigprocmask(how, set, null)
+        Block(set)
         mem.Free(set)
     end
 end
@@ -170,5 +208,106 @@ pub func WakeWinch():
         ret
     else:
         _ := kill(getpid(), WinchSignal)
+    end
+end
+
+@en "NewSet"
+/// Allocate an empty signal set. The caller owns the memory and releases it
+/// with mem.Free. Returns null on Windows, where sets do not exist, and when
+/// the allocation fails.
+pub func NewSet(): void*:
+    if SALAM_OS_WINDOWS:
+        ret null
+    else:
+        set := mem.AllocateZeroed(SignalSetSize as u64)
+        if set == null: ret null end
+        _ := sigemptyset(set)
+        ret set
+    end
+end
+
+@en "FillSet"
+/// Fill set with every signal the platform knows. A no-op when set is null
+/// and on Windows.
+pub func FillSet(set: void*):
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        if set == null: ret end
+        _ := sigfillset(set)
+    end
+end
+
+@en "AddSignal"
+/// Add sig to set, returning false on failure. False when set is null and
+/// when sig is not positive: Darwin accepts 0 in sigaddset and Linux
+/// rejects it, so both are normalized away. Always false on Windows.
+pub func AddSignal(set: void*, sig: int): bool:
+    if SALAM_OS_WINDOWS:
+        ret false
+    else:
+        if set == null or sig <= 0: ret false end
+        ret sigaddset(set, sig) == 0
+    end
+end
+
+@en "DelSignal"
+/// Remove sig from set, returning false on failure. The guards match
+/// AddSignal. Always false on Windows.
+pub func DelSignal(set: void*, sig: int): bool:
+    if SALAM_OS_WINDOWS:
+        ret false
+    else:
+        if set == null or sig <= 0: ret false end
+        ret sigdelset(set, sig) == 0
+    end
+end
+
+@en "IsSignal"
+/// True when sig is in set. False when set is null or sig is not positive;
+/// sigismember's -1 error is never treated as membership. Always false on
+/// Windows.
+pub func IsSignal(set: void*, sig: int): bool:
+    if SALAM_OS_WINDOWS:
+        ret false
+    else:
+        if set == null or sig <= 0: ret false end
+        ret sigismember(set, sig) == 1
+    end
+end
+
+@en "Block"
+/// Add set to the calling thread's signal mask so its signals queue instead
+/// of being delivered. A no-op when set is null and on Windows.
+pub func Block(set: void*):
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        if set == null: ret end
+        _ := sigprocmask(_SIG_BLOCK, set, null)
+    end
+end
+
+@en "Unblock"
+/// Remove set from the calling thread's signal mask. A no-op when set is
+/// null and on Windows.
+pub func Unblock(set: void*):
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        if set == null: ret end
+        _ := sigprocmask(_SIG_UNBLOCK, set, null)
+    end
+end
+
+@en "SetMask"
+/// Replace the calling thread's signal mask with set. A no-op when set is
+/// null and on Windows.
+pub func SetMask(set: void*):
+    if SALAM_OS_WINDOWS:
+        ret
+    else:
+        if set == null: ret end
+        _ := sigprocmask(_SIG_SETMASK, set, null)
     end
 end
