@@ -1,0 +1,74 @@
+/*
+ * signal - POSIX signal primitives for Salam (2026)
+ *
+ * Salam: https://github.com/SalamLang/Salam
+ *
+ * Repository: https://github.com/curedbylethe/signal
+ * License: GPL-3.0-or-later
+ *
+ */
+
+// Unit tests for the SIGWINCH primitives. These are headless: they never
+// open a terminal, they install the handler, block SIGWINCH, raise it
+// against the process itself, and consume it with sigwait. That proves the
+// full path Screen relies on, including that a blocked signal raised with a
+// non-default disposition is queued and delivered, and that a thread spawned
+// after BlockWinch inherits the mask and can own the wait.
+
+import testing
+import mem
+
+include "../signal.salam"
+
+// How many SIGWINCHes the watcher thread consumed. Written by the watcher,
+// read by main after join (which orders the two), so no locking is needed
+// and the assertions stay on the main thread.
+mut _thread_hits := 0
+
+func watcher(set: void*):
+    if signal.WaitWinch(set) == signal.WinchSignal:
+        _thread_hits += 1
+    end
+end
+
+func test_supported():
+    // CI runs ubuntu and macos only, both POSIX, so the watch is available.
+    testing.AssertTrue(signal.WinchSupported())
+end
+
+func test_blocked_self_signal_is_consumed():
+    signal.InstallWinchHandler()
+    set := signal.NewWinchSet()
+    testing.AssertTrue(set != null)
+    signal.BlockWinch()
+    // Handler installed and signal blocked: raise it at the process, then
+    // consume it. Mirrors probe 1g.
+    signal.WakeWinch()
+    testing.AssertEqInt(signal.WaitWinch(set), signal.WinchSignal)
+    // A null set must not wait (it would block forever), it returns 0.
+    testing.AssertEqInt(signal.WaitWinch(null), 0)
+    mem.Free(set)
+end
+
+func test_thread_inherits_mask():
+    signal.InstallWinchHandler()
+    signal.BlockWinch()
+    set := signal.NewWinchSet()
+    // The watcher is spawned after blocking, so it inherits SIGWINCH in its
+    // mask and its sigwait is the one that consumes the signal, not main.
+    // Mirrors probe 2b, with a single raise: SIGWINCH is a standard signal
+    // and two pending copies coalesce into one, so raising twice before the
+    // watcher runs would be a race, not a stronger test.
+    h := spawn(watcher, set)
+    signal.WakeWinch()
+    join(h)
+    testing.AssertEqInt(_thread_hits, 1)
+    mem.Free(set)
+end
+
+func main:
+    test_supported()
+    test_blocked_self_signal_is_consumed()
+    test_thread_inherits_mask()
+    ret testing.Summary()
+end
