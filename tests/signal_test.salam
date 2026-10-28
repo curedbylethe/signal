@@ -111,8 +111,8 @@ func test_blocked_self_signal_is_consumed():
     // consume it. Mirrors probe 1g.
     signal.WakeWinch()
     testing.AssertEqInt(signal.WaitWinch(set), signal.WinchSignal)
-    // A null set must not wait (it would block forever), it returns 0.
-    testing.AssertEqInt(signal.WaitWinch(null), 0)
+    // A null set must not wait (it would block forever), it is refused.
+    testing.AssertEqInt(signal.WaitWinch(null), signal.WaitInvalid)
     mem.Free(set)
 end
 
