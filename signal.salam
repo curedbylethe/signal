@@ -44,10 +44,45 @@
  * The mask half goes through pthread_sigmask, not sigprocmask, because
  * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
  * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
- * true.
+ * true. The mask is per thread, so the thread that restores is normally the
+ * thread that installed; a spawned thread inherits the mask, which is how a
+ * dedicated watcher can take the wait over from the thread that installed.
  * Install blocks the signal on the calling thread as its last step, after the
  * disposition is in place: a signal blocked while SIG_DFL is still installed
  * is discarded at generation on Darwin, so the other order loses it.
+ *
+ * One waiter per process. Wait and WaitTimeout claim the registry's waiter
+ * flag for the duration of the call, and a second waiter is told WaitBusy
+ * instead of being handed a subset of the deliveries, because POSIX gives a
+ * blocked signal to exactly one waiting thread and does not say which. The
+ * claim lives in the registry, so it exists once a signal has been installed.
+ *
+ * A wait returns a status, never a sentinel. WaitArrived (1) means the
+ * out-block now holds the signal number; WaitTimedOut (0) means the bound won
+ * and the out-block was not written, and only WaitTimeout returns it;
+ * WaitInvalid (-1) means a bad argument, a target with no bounded wait, or
+ * Windows; WaitFailed (-2) means the kernel call failed; WaitBusy (-3) means
+ * another thread owns the wait and nothing was waited on. Wait never returns
+ * 0, and 0 from WaitWinch is Windows only, so a resize is no longer reported
+ * with the same value as a broken call. A timed wait needs an Install first,
+ * because the bound is built with the registry. Neither Wait nor WaitTimeout
+ * allocates: the registry, the kqueue and the timespec buffer belong to the
+ * install. WaitWinch allocates its private out-block once, on first use.
+ *
+ * Signals coalesce. A standard signal raised twice while it is blocked leaves
+ * one instance pending, so a waiter observes one arrival, not two. That is why
+ * the tests assert a single delivery where two raises could race, and why a
+ * wake-up means "look at the state again", never "one resize happened".
+ *
+ * A bound is not a self-pipe. With the signal blocked — the model this package
+ * documents — the installed handler never runs, so nothing could write the
+ * pipe, and unblocking the signal to make one work would abandon sigwait and
+ * Install's handler contract. Darwin measures the bound with a kqueue
+ * EVFILT_SIGNAL filter, which counts generations of the signal without
+ * consuming it; one filter per signal is why a Darwin WaitTimeout takes a set
+ * of exactly one, and nothing in this package's surface needs more. Linux
+ * measures the same bound with sigtimedwait and keeps the general set. The
+ * pending signal itself is taken by sigwait on both.
  *
  * Every POSIX target installs through sigaction, never signal(). Salam has no
  * C struct here, so the struct sigaction is a zeroed byte block written
@@ -69,8 +104,11 @@
  * is reentrant. The no-op below meets the contract by doing nothing.
  *
  * Deliberate non-goals. No handler body: the handler runs on the delivery
- * thread and must stay async-signal-safe. No sigtimedwait on macOS, which has
- * none, and no SIGALRM timeouts; the Linux bounded wait is its only caller.
+ * thread and must stay async-signal-safe. No bounded wait built on
+ * sigtimedwait for Darwin, which does not have it — the bound there is
+ * kqueue's EVFILT_SIGNAL filter — while Linux, which has it, uses it. No
+ * SIGALRM on either: a handler cannot interrupt sigwait, so an alarm would not
+ * break the wait, and SIGALRM is process-wide state the caller may already own.
  * Sets are built and edited by libc's sigemptyset, sigfillset, sigaddset,
  * sigdelset and sigismember. On Darwin those names are
  * C macros at signal.h:116-126 shadowing the prototypes at 89-97; the
@@ -80,14 +118,17 @@
  * measured all five linking and running and sizeof(sigset_t) at 4. The size
  * is not universal: 4 on OpenBSD, 16 on FreeBSD and NetBSD, 128 on Linux.
  * DragonFly has no Salam target, so no build selects a size for it. Windows
- * is a stub surface — there is no SIGWINCH and no sigset_t, so
- * every function is safe to call and WinchSupported reports false so callers
- * can fall back to polling.
+ * is a stub surface — there is no SIGWINCH and no sigset_t: every function is
+ * safe to call, WinchSupported reports false, Install returns null, Wait and
+ * WaitTimeout return WaitInvalid, and WaitWinch returns 0, so callers fall
+ * back to polling the terminal size.
  *
  * Three public surfaces. SIGWINCH: WinchSignal, WinchSupported, NewWinchSet,
- * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch. Disposition: Install,
- * Restore, CurrentMask. Signal sets: SignalSetSize, NewSet, FillSet,
- * AddSignal, DelSignal, IsSignal, Block, Unblock, SetMask.
+ * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch. Disposition and
+ * waits: Install, Restore, CurrentMask, Wait, WaitTimeout, and the five
+ * WaitArrived, WaitTimedOut, WaitInvalid, WaitFailed and WaitBusy statuses.
+ * Signal sets: SignalSetSize, NewSet, FillSet, AddSignal, DelSignal, IsSignal,
+ * Block, Unblock, SetMask.
  */
 
 package signal
