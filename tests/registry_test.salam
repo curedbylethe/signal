@@ -93,6 +93,12 @@ func test_restore_order_is_free():
     after := signal.CurrentMask()
     testing.AssertTrue(not signal.IsSignal(after, signal.WinchSignal))
     testing.AssertEqInt64(live_handler(signal.WinchSignal) as i64, 0)
+    // A repeated Restore does nothing: this handle's mask was read while the
+    // signal was blocked, so applying it here would block it with no owner.
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, second))
+    again := signal.CurrentMask()
+    testing.AssertTrue(not signal.IsSignal(again, signal.WinchSignal))
+    mem.Free(again)
     mem.Free(after)
     mem.Free(second)
     mem.Free(first)
