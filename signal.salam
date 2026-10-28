@@ -69,9 +69,10 @@
  * is reentrant. The no-op below meets the contract by doing nothing.
  *
  * Deliberate non-goals. No handler body: the handler runs on the delivery
- * thread and must stay async-signal-safe. No sigtimedwait (absent on macOS)
- * and no SIGALRM timeouts. Sets are built and edited by libc's sigemptyset,
- * sigfillset, sigaddset, sigdelset and sigismember. On Darwin those names are
+ * thread and must stay async-signal-safe. No sigtimedwait on macOS, which has
+ * none, and no SIGALRM timeouts; the Linux bounded wait is its only caller.
+ * Sets are built and edited by libc's sigemptyset, sigfillset, sigaddset,
+ * sigdelset and sigismember. On Darwin those names are
  * C macros at signal.h:116-126 shadowing the prototypes at 89-97; the
  * real symbols (_sigemptyset, _sigfillset, _sigaddset, _sigdelset,
  * _sigismember) are ordinary libSystem exports, and a non-C extern binds the
@@ -112,6 +113,23 @@ if not SALAM_OS_WINDOWS:
         func sigwait(set: void*, sig: void*): int
         func kill(pid: int, sig: int): int
         func getpid(): int
+        func close(fd: int): int
+    end
+end
+
+// The bounded wait's own entry points, split by kernel because neither has the
+// other's: Darwin has kqueue and no sigtimedwait, Linux has sigtimedwait and no
+// kqueue. Nothing here is declared on Windows, where the wait is a stub.
+if SALAM_OS_MAC:
+    extern:
+        func kqueue(): int
+        func kevent(kq: int, changelist: void*, nchanges: int, eventlist: void*, nevents: int, timeout: void*): int
+        func sigpending(set: void*): int
+    end
+else SALAM_OS_LINUX:
+    extern:
+        func sigtimedwait(set: void*, info: void*, timeout: void*): int
+        func __errno_location(): void*
     end
 end
 
@@ -180,6 +198,13 @@ else:
     const _SIG_BLOCK := 0
     const _SIG_UNBLOCK := 1
     const _SIG_SETMASK := 2
+end
+
+// sigtimedwait returns -1 for a timeout and for a failure, so only errno
+// separates them. EAGAIN is 11 on glibc and musl; Darwin never reads errno,
+// because sigwait returns the error number itself.
+if SALAM_OS_LINUX:
+    const _EAGAIN := 11
 end
 
 // struct sigaction: sys/signal.h on Darwin, OpenBSD, NetBSD and FreeBSD,
@@ -352,6 +377,27 @@ if not SALAM_OS_WINDOWS:
     end
 end
 
+if SALAM_OS_MAC:
+    // The one signal in set, or -1 when there is none or more than one. The
+    // registry registers one EVFILT_SIGNAL per signal, so a timed wait can
+    // carry the bound of exactly one; Linux needs no filter and keeps the
+    // general set. The scan costs about a microsecond per call, and if it ever
+    // shows in a profile the signal can be cached in the registry at Install.
+    func _single_signal(set: void*): int:
+        mut found := 0
+        mut i := 1
+        until i <= 64:
+            if IsSignal(set, i):
+                if found > 0: ret -1 end
+                found = i
+            end
+            i += 1
+        end
+        if found == 0: ret -1 end
+        ret found
+    end
+end
+
 @en "WinchSupported"
 /// True when this process can receive SIGWINCH, i.e. on POSIX. Windows has
 /// no SIGWINCH, so the watcher must not start there and callers should poll
@@ -482,6 +528,36 @@ pub func Install(sig: int, handler: void*): void*:
             _ := sync.Unlock(_mu)
             ret null
         end
+        if SALAM_OS_MAC:
+            // The bound in WaitTimeout waits on this kqueue, which belongs to
+            // the slot: one per install cycle, never created on the wait path.
+            kq := kqueue()
+            if kq < 0:
+                _ := _put_back(sig, canonical)
+                mem.Free(canonical)
+                _ := sync.Unlock(_mu)
+                ret null
+            end
+            // struct kevent, 32 bytes: ident 0, filter 8, flags 10, fflags 12,
+            // data 16, udata 24. EVFILT_SIGNAL is -6; EV_ADD|EV_ENABLE is
+            // 0x0005. Registration is the whole job: EV_CLEAR is automatic, so
+            // the filter is read by the wait and never re-armed.
+            kev := ((slot as u64) + (_REG_SLOT_KEVENT as u64)) as void*
+            (kev as i64*)[0] = sig as i64
+            (kev as i16*)[4] = -6 as i16
+            (kev as i16*)[5] = 5 as i16
+            (kev as i32*)[3] = 0
+            (kev as i64*)[2] = 0
+            (kev as u64*)[3] = 0
+            if kevent(kq, kev, 1, null, 0, null) != 0:
+                _ := close(kq)
+                _ := _put_back(sig, canonical)
+                mem.Free(canonical)
+                _ := sync.Unlock(_mu)
+                ret null
+            end
+            (((slot as u64) + (_REG_SLOT_KQUEUE as u64)) as i64*)[0] = kq as i64
+        end
         copy := mem.AllocateZeroed(_HANDLE_SIZE as u64)
         if copy == null:
             _ := _put_back(sig, canonical)
@@ -536,6 +612,15 @@ pub func Restore(sig: int, prev: void*): bool:
             mem.Free((slot as u64*)[2] as void*)
             (slot as u64*)[1] = 0
             (slot as u64*)[2] = 0
+            if SALAM_OS_MAC:
+                // A kqueue is a descriptor, so it goes with the snapshot: kept
+                // past this point, every install/restore cycle leaks one.
+                kq := ((slot as u64) + (_REG_SLOT_KQUEUE as u64)) as i64*
+                if kq[0] > 0:
+                    _ := close(kq[0] as int)
+                    kq[0] = 0
+                end
+            end
             _ := sync.Unlock(_mu)
             ret ok
         end
@@ -587,6 +672,87 @@ pub func Wait(set: void*, out: void*): int:
         _release_waiter()
         if status == 0: ret WaitArrived end
         ret WaitFailed
+    end
+end
+
+// The bound is not a self-pipe: with the signal blocked — the model this
+// package documents — the installed handler never runs, so nothing could write
+// a pipe, and unblocking the signal to make one work would abandon sigwait and
+// Install's handler contract. Darwin measures the bound with a kqueue
+// EVFILT_SIGNAL filter instead, which counts generations of the signal without
+// consuming it; the queue that is actually pending is then taken by sigwait.
+@en "WaitTimeout"
+/// Block the calling thread until a signal in set is queued or millis
+/// milliseconds go by. On arrival the number is written as an i32 at out[0]
+/// and WaitArrived is returned; when the bound wins it returns WaitTimedOut
+/// and out is untouched, like every other non-arrival status. millis == 0
+/// probes once without blocking, and millis < 0 is WaitInvalid. The signal
+/// must be installed, because the bound is built with the registry, and the
+/// thread must have it blocked, as BlockWinch does. Darwin
+/// times one signal per call, since the registry registers one kqueue filter
+/// per signal: a set with no signal or with more than one is WaitInvalid
+/// there, while Linux takes any set. Nothing is allocated here. Returns
+/// WaitInvalid for a null set or null out, WaitBusy when another thread
+/// already waits, and WaitFailed when the kernel call failed.
+pub func WaitTimeout(set: void*, out: void*, millis: int): int:
+    if SALAM_OS_WINDOWS:
+        ret WaitInvalid
+    else:
+        if set == null or out == null or millis < 0: ret WaitInvalid end
+        // The kqueue and the timespec buffer are built with the registry on
+        // the first Install, so there is nothing to bound a wait with before
+        // one. sig stays 0 on Linux, which has no filter and needs no signal.
+        if _reg == null: ret WaitInvalid end
+        mut sig := 0
+        if SALAM_OS_MAC:
+            sig = _single_signal(set)
+            if sig < 0: ret WaitInvalid end
+        end
+        if not _claim_waiter(): ret WaitBusy end
+        // Both branches need a 16-byte tv_sec/tv_nsec that the caller cannot
+        // take the address of and the wait path may not allocate. Darwin keeps
+        // it in the signal's slot; Linux needs no filter, so sig is 0 and the
+        // unused slot 0 is one process-wide buffer.
+        slot := _slot(sig)
+        ts := ((slot as u64) + (_REG_SLOT_TIMESPEC as u64)) as i64*
+        ts[0] = (millis / 1000) as i64
+        ts[1] = ((millis % 1000) * 1000000) as i64
+        mut status := WaitFailed
+        if SALAM_OS_MAC:
+            kq := (((slot as u64) + (_REG_SLOT_KQUEUE as u64)) as i64*)[0] as int
+            kev := ((slot as u64) + (_REG_SLOT_KEVENT as u64)) as void*
+            n := kevent(kq, null, 0, kev, 1, ts as void*)
+            if n > 0:
+                // The filter counted a generation, but a generation can be
+                // counted and already consumed. Ask what is queued before
+                // draining: without this guard a drained generation parks the
+                // caller in sigwait with no timeout left to rescue it.
+                pending := ((_reg as u64) + (_REG_HDR_PENDING as u64)) as void*
+                if sigpending(pending) == 0 and IsSignal(pending, sig):
+                    if sigwait(set, out) == 0: status = WaitArrived end
+                end
+                if status != WaitArrived: status = WaitTimedOut end
+            else if n == 0:
+                status = WaitTimedOut
+            end
+        else SALAM_OS_LINUX:
+            rc := sigtimedwait(set, null, ts as void*)
+            if rc > 0:
+                (out as i32*)[0] = rc
+                status = WaitArrived
+            else if rc < 0:
+                // EAGAIN is the timeout; anything else, EINTR included, is a
+                // failure the caller sees rather than one to loop over.
+                if (__errno_location() as i32*)[0] == _EAGAIN:
+                    status = WaitTimedOut
+                end
+            end
+        else:
+            // No bounded wait on this target, so nothing was waited on.
+            status = WaitInvalid
+        end
+        _release_waiter()
+        ret status
     end
 end
 
