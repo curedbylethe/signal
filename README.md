@@ -101,8 +101,10 @@ install of a handler does the work, a later install of the same handler only
 refcounts, and a later install of a *different* handler is refused with null —
 a handler that never runs is the failure this package exists to prevent. Each
 `Install` returns a caller-owned copy, so both consumers can free what they
-were given; the last `Restore` puts the first install's disposition and mask
-back, whichever order the handles are freed in. One
+were given; a `Restore` above the last reference only drops the count, so the
+signal stays blocked while any consumer still owns it, and the last `Restore`
+puts the first install's disposition and mask back, whichever order the handles
+are freed in. One
 waiter at a time, too: a second concurrent `Wait` or `WaitTimeout` returns
 `WaitBusy` rather than silently receiving a subset of the deliveries, so a
 consumer retries instead of splitting them.
@@ -156,7 +158,7 @@ end
 | `WaitTimeout` | `Wait` with a bound in milliseconds: `WaitTimedOut` when the bound wins and `out` untouched, `millis` 0 probes once, negative is `WaitInvalid`; one signal per call on Darwin, any set on Linux, `WaitInvalid` on the other POSIX targets |
 | `WaitWinch` | Park until `SIGWINCH` is queued and return its number, or a negative status; `0` on Windows only |
 | `WakeWinch` | Send `SIGWINCH` to this process to break the wait; false on Windows or when the call failed |
-| `Restore` | Put the captured state back: above one reference the calling thread's mask, at the last reference the first install's disposition and mask — either order leaves the signal unblocked — and from then on a further call does nothing and succeeds; false when the handle is null or a step failed |
+| `Restore` | Drop a reference: above the last one nothing else changes, so the signal stays blocked while anyone owns it; at the last one the first install's disposition and mask go back, either order; after that a further call does nothing and succeeds; false when the handle is null or a step failed |
 
 ### Wait status
 

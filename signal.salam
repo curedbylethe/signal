@@ -37,11 +37,11 @@
  * Further installs of the same handler only refcount; an install of a
  * different handler while the signal is owned is refused with null, because a
  * handler that never runs is the silent mismatch this package exists to
- * remove. Restore puts this thread's mask back above one reference and, at the
- * last one, puts back the state the first Install captured — disposition and
- * mask both, whichever order the handles are freed in — then frees the
- * canonical snapshot; at zero it does nothing and succeeds, because the state
- * is already back and a handle's mask would undo it.
+ * remove. Above one reference Restore only drops the count, so the signal stays
+ * blocked while anyone still owns it; at the last one it puts back the state
+ * the first Install captured — disposition and pre-block mask both, whichever
+ * order the handles are freed in — then frees the canonical snapshot; at zero
+ * it does nothing and succeeds, because a handle's mask would undo that.
  * The mask half goes through pthread_sigmask, not sigprocmask, because
  * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
  * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
@@ -627,11 +627,12 @@ end
 
 @en "Restore"
 /// Put back the state an Install snapshot captured on the same thread,
-/// returning whether both steps succeeded. Above one reference only the
-/// calling thread's mask goes back, so the disposition stays installed. At the
+/// returning whether both steps succeeded. Above one reference only the count
+/// drops: the signal stays blocked for the consumers that still own it. At the
 /// last reference the state the *first* Install captured goes back in full —
-/// both the disposition and that mask — so freeing handles in either order
-/// leaves the signal unblocked. The registry then frees its canonical
+/// both the disposition and its pre-block mask — so freeing handles in either
+/// order leaves the signal unblocked and no owner is left with a blocked
+/// signal. The registry then frees its canonical
 /// snapshot. A further Restore does nothing and succeeds: the state is already
 /// back, and re-applying a handle would restore the mask it was taken with.
 /// Frees nothing the caller owns.
@@ -650,11 +651,12 @@ pub func Restore(sig: int, prev: void*): bool:
         slot := _slot(sig)
         refs := (slot as i64*)[_REG_SLOT_REFS]
         if refs > 1:
+            // Only the count drops. The signal stays blocked while anyone
+            // still owns it: unblocking here would let a raise run the
+            // handler instead of queueing for the remaining consumer's wait.
             (slot as i64*)[_REG_SLOT_REFS] = refs - 1
-            mask := ((prev as u64) + (_SIGACTION_SIZE as u64)) as void*
-            ok := SetMask(mask)
             _ := sync.Unlock(_mu)
-            ret ok
+            ret true
         end
         if refs == 1:
             (slot as i64*)[_REG_SLOT_REFS] = 0
