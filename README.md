@@ -8,8 +8,8 @@ plumbing extracted from
 The package owns the process-wide handler and the blocked signal mask, and
 nothing else: no terminal state, no policy, no widget code.
 
-> **Status: 0.1.1, early development.** The `SIGWINCH` API is a
-> behaviour-identical move of `basalam/signal.salam`; the signal-set API is new.
+> **Status: early development.** The signal-set API shipped in `v0.1.1`; the
+> disposition API (`Install`, `Restore`, `CurrentMask`) is unreleased on `main`.
 > Hardening is tracked separately.
 
 ## Install
@@ -40,10 +40,13 @@ func main:
         ret
     end
 
-    // The handler comes first: a signal blocked while its disposition is
-    // still SIG_DFL is discarded at generation on Darwin.
-    signal.InstallWinchHandler()
-    signal.BlockWinch()
+    // Install snapshots the disposition and the mask, gives SIGWINCH its
+    // handler, then blocks it: a signal blocked while its disposition is still
+    // SIG_DFL would be discarded at generation on Darwin, so the order is the
+    // function's job, not the caller's.
+    prev := signal.InstallWinchHandler()
+    defer mem.Free(prev)
+    defer signal.Restore(signal.WinchSignal, prev)
 
     set := signal.NewWinchSet()
     defer mem.Free(set)
@@ -58,6 +61,13 @@ func main:
     end
 end
 ```
+
+A handler passed to `Install` runs on the thread that took the signal, so it
+may call async-signal-safe functions only: no allocation, no locks, no stdio,
+no calls into the Salam runtime. Touching only `volatile sig_atomic_t`,
+lock-free atomics or read-only data is safe. It must also save `errno` on
+entry and restore it before returning. `InstallWinchHandler` supplies the
+package's no-op handler, which meets the contract by doing nothing.
 
 ### Signal sets
 
@@ -74,9 +84,9 @@ func main:
     _ := signal.AddSignal(set, 15) // SIGTERM
 
     if signal.IsSignal(set, 15):
-        signal.Block(set)
+        _ := signal.Block(set)
         // A sigwait on the set now covers both signals.
-        signal.Unblock(set)
+        _ := signal.Unblock(set)
     end
 end
 ```
@@ -90,10 +100,16 @@ end
 | `WinchSignal` | The `SIGWINCH` number, 28 on macOS and Linux |
 | `WinchSupported` | True on POSIX, false on the Windows stub surface |
 | `NewWinchSet` | Allocate a caller-owned signal set holding only `SIGWINCH` |
-| `InstallWinchHandler` | Install the process-wide no-op handler |
-| `BlockWinch` | Add `SIGWINCH` to the calling thread's mask |
+| `Install` | Save the previous disposition and mask, install `handler`, block `sig`; returns a caller-owned handle |
+| `InstallWinchHandler` | Install the package no-op handler and block; returns the previous disposition |
+| `BlockWinch` | Add `SIGWINCH` to the calling thread's mask; false on Windows or when the call failed |
 | `WaitWinch` | Park until `SIGWINCH` is queued, return its number, or 0 |
-| `WakeWinch` | Send `SIGWINCH` to this process to break the wait |
+| `WakeWinch` | Send `SIGWINCH` to this process to break the wait; false on Windows or when the call failed |
+| `Restore` | Put a saved disposition and mask back; false when the handle is null or a step failed, and safe to call twice |
+
+`Install` takes a handler of your own: pass `&handler`, and that handler owes
+the async-signal-safety contract above. Hand the returned handle to `Restore`
+on the way out and release it with `mem.Free`.
 
 ### Signal sets
 
@@ -105,13 +121,23 @@ end
 | `AddSignal` | Add one signal number; false when the number is invalid or unsupported |
 | `DelSignal` | Remove one signal number; false when the number is invalid or unsupported |
 | `IsSignal` | True when the set contains the number |
-| `Block` | Block every signal in the set on the calling thread |
-| `Unblock` | Unblock every signal in the set on the calling thread |
-| `SetMask` | Replace the calling thread's mask with the set |
+| `Block` | Block every signal in the set on the calling thread; false when `set` is null or the mask could not be changed |
+| `Unblock` | Unblock every signal in the set on the calling thread; false when `set` is null or the mask could not be changed |
+| `SetMask` | Replace the calling thread's mask with the set; false when `set` is null or the mask could not be changed |
+| `CurrentMask` | Copy of the calling thread's mask; caller frees |
 
-CI builds and tests macOS and Linux only, so the BSD values and the Windows
-stubs are not exercised by CI; DragonFly is not a Salam target. The signal-set
-API is part of `v0.1.1`.
+Every POSIX target installs the disposition through `sigaction`, never
+`signal()`: Darwin, Linux, FreeBSD, NetBSD and OpenBSD. The `struct sigaction`
+is a zeroed block written through per-target offsets inside `signal.salam`;
+only `SA_RESTART` is set and `sa_mask` stays empty, so a syscall interrupted by
+a delivered signal restarts. `ci/sigaction_offsets.c` proves those offsets with
+`_Static_assert`s against each platform's real headers and a `sigaction` round
+trip, and CI runs it in a job per BSD. Salam has no BSD port, so the BSD
+branches are proven by that oracle and reviewed, not compiled by this package.
+
+CI builds and tests this package on macOS and Linux only; the Windows surface
+is a stub and no job compiles it, and DragonFly is not a Salam target. The
+signal-set API is part of `v0.1.1`.
 
 ## Contributing
 
