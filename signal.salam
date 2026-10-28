@@ -406,18 +406,14 @@ if not SALAM_OS_WINDOWS:
         ret disposition_ok and mask_ok
     end
 
-    // A caller-owned copy of canonical holding this thread's mask. The
-    // sigaction bytes come from the canonical snapshot; the mask is read here,
-    // so Restore unblocks the thread that installed.
+    // A caller-owned copy of the canonical snapshot: sigaction bytes and the
+    // first install's mask. No path applies a copy's mask — the last Restore
+    // applies the canonical state itself — so the copy is made whole and the
+    // reading thread's mask is never consulted.
     func _snapshot_copy(canonical: void*): void*:
         copy := mem.AllocateZeroed(_HANDLE_SIZE as u64)
         if copy == null: ret null end
-        mem.Copy(copy, canonical, _SIGACTION_SIZE as u64)
-        mask := ((copy as u64) + (_SIGACTION_SIZE as u64)) as void*
-        if pthread_sigmask(_SIG_BLOCK, null, mask) != 0:
-            mem.Free(copy)
-            ret null
-        end
+        mem.Copy(copy, canonical, _HANDLE_SIZE as u64)
         ret copy
     end
 end
@@ -515,8 +511,7 @@ pub func Install(sig: int, handler: void*): void*:
                 _ := sync.Unlock(_mu)
                 ret null
             end
-            // Same handler: this thread's mask in a fresh copy, so both
-            // consumers own their handle.
+            // Same handler: a fresh copy so both consumers own their handle.
             copy := _snapshot_copy((slot as u64*)[_REG_SLOT_PREV] as void*)
             if copy == null:
                 _ := sync.Unlock(_mu)
@@ -661,10 +656,9 @@ pub func Restore(sig: int, prev: void*): bool:
         if refs == 1:
             (slot as i64*)[_REG_SLOT_REFS] = 0
             // The last Restore puts back the state the *first* Install
-            // captured, not the caller's copy: every copy's mask was read
-            // after the signal was blocked, so restoring a copy would leave
-            // the signal blocked at refcount zero for a caller that frees its
-            // handles in the other order.
+            // captured, never a copy: a copy may have been taken by a thread
+            // whose mask is not the one to restore, and either free order must
+            // end with the signal unblocked.
             canonical := (slot as u64*)[_REG_SLOT_PREV] as void*
             ok := _put_back(sig, canonical)
             // refs reached zero, so the canonical snapshot goes; a later
@@ -685,8 +679,8 @@ pub func Restore(sig: int, prev: void*): bool:
             ret ok
         end
         // refs == 0: the state went back at the last reference, so there is
-        // nothing left to apply. Re-applying this handle would be wrong: every
-        // copy made while the signal was owned carries the blocked mask.
+        // nothing left to apply; re-applying a handle would resurrect whatever
+        // mask it was copied with.
         _ := sync.Unlock(_mu)
         ret true
     end
