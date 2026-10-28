@@ -8,11 +8,11 @@ plumbing extracted from
 The package owns the process-wide handler and the blocked signal mask, and
 nothing else: no terminal state, no policy, no widget code.
 
-> **Status: early development.** `v0.1.1` shipped the signal-set API. The
-> disposition and wait API (`Install`, `Restore`, `Wait`, `WaitTimeout`) is
-> unreleased: it lands with the stacked capture-and-restore branch and is not
-> on `main` yet. Windows is a documented stub. Hardening is tracked
-> separately.
+> **Status: early development.** `v0.1.1` shipped the signal-set API and
+> `v0.1.2` ships the disposition and wait API (`Install`, `Restore`, `Wait`,
+> `WaitTimeout`): one process-wide owner per signal, five explicit wait
+> statuses, and a bounded wait on both kernels. Windows is a documented stub.
+> Hardening is tracked separately.
 
 ## Install
 
@@ -25,7 +25,7 @@ You need the Salam compiler, version 0.5.9 or later:
 Add signal with Salam's package manager:
 
 ```sh
-salam add github.com/curedbylethe/signal@v0.1.1
+salam add github.com/curedbylethe/signal@v0.1.2
 ```
 
 ## Usage
@@ -203,7 +203,7 @@ CI builds and tests this package on macOS and Linux with both backends. The
 never runs it: it names every public symbol so a Windows body that reached for
 a POSIX extern fails to compile. That job proves the stub compiles, not that it
 waits. DragonFly is not a Salam target. The signal-set API is part of
-`v0.1.1`.
+`v0.1.1`; everything below `Install` is `v0.1.2`.
 
 ## Contributing
 
