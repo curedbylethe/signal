@@ -50,3 +50,17 @@ jobs:
           release: "7.9"
           usesh: true
           run: cc -o /tmp/abi ci/sigaction_offsets.c && /tmp/abi
+
+  windows-compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: SalamLang/Salam/.github/actions/setup-salam@d5e0c093c7e0d978bc5eae404fdeed4755d581d9  # v0.5.9
+        with:
+          version: '0.5.9'
+      - run: salam version
+      # Compile only, never run: the exe reports WinchSupported() == false and
+      # every POSIX assertion would fail. mkdir is ours because build/ is
+      # gitignored and salam does not create the output directory.
+      - shell: bash
+        run: mkdir -p build && salam build ci/windows_compile.salam --output=build/windows_check.exe

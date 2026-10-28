@@ -1,0 +1,60 @@
+/*
+ * signal - POSIX signal primitives for Salam (2026)
+ *
+ * Salam: https://github.com/SalamLang/Salam
+ *
+ * Repository: https://github.com/curedbylethe/signal
+ * License: GPL-3.0-or-later
+ *
+ */
+
+// Compile-only consumer of the Windows branch. Nothing here runs: the
+// windows-compile job builds it on windows-latest and never starts it. Its
+// only job is to name every public symbol,
+// because a function no caller reaches is checked no deeper than its
+// signature, so a Windows body that named a POSIX extern would still be
+// accepted until something instantiates it. WinchSupported() is false on
+// Windows by design, so no assertion here depends on a value.
+//
+// Every result is discarded on purpose; the point is the call, not the answer.
+
+include "../signal.salam"
+
+func main:
+    // The five wait statuses and the two platform constants, so a change in
+    // any of them is still type-checked against a consumer.
+    statuses := signal.WaitArrived + signal.WaitTimedOut + signal.WaitInvalid + signal.WaitFailed + signal.WaitBusy
+    _ := statuses + signal.WinchSignal + signal.SignalSetSize
+    _ := signal.WinchSupported()
+
+    // SIGWINCH: a set, a disposition, the block-then-wait pair and the wake.
+    _ := signal.NewWinchSet()
+    _ := signal.InstallWinchHandler()
+    _ := signal.BlockWinch()
+    _ := signal.WakeWinch()
+    // WaitWinch takes the set and the two waits take an out-block. The block
+    // is null because no out-block can be produced without mem, which Windows
+    // does not import; both waits refuse null before touching it.
+    winch_set := signal.NewWinchSet()
+    _ := signal.WaitWinch(winch_set)
+    _ := signal.Wait(winch_set, null)
+    _ := signal.WaitTimeout(winch_set, null, 0)
+
+    // Disposition: install, restore and read the caller's own mask.
+    _ := signal.Install(signal.WinchSignal, null)
+    _ := signal.Restore(signal.WinchSignal, null)
+    _ := signal.CurrentMask()
+
+    // Signal sets, built and edited.
+    set := signal.NewSet()
+    signal.FillSet(set)
+    _ := signal.AddSignal(set, signal.WinchSignal)
+    _ := signal.DelSignal(set, signal.WinchSignal)
+    _ := signal.IsSignal(set, signal.WinchSignal)
+
+    // Signal masks.
+    _ := signal.Block(set)
+    _ := signal.Unblock(set)
+    _ := signal.SetMask(set)
+    ret 0
+end
