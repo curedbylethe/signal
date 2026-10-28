@@ -37,7 +37,10 @@ func noop_b(_sig: int):
 end
 
 func live_handler(sig: int): u64:
-    buf := mem.AllocateZeroed(16 as u64)
+    // struct sigaction is 16 bytes on Darwin but 152 on glibc, and the kernel
+    // writes the whole struct: the block is sized for the largest target, not
+    // the one this test happens to run on.
+    buf := mem.AllocateZeroed(256 as u64)
     if buf == null: ret 0 end
     _ := sigaction(sig, null, buf)
     handler := (buf as u64*)[0]
@@ -76,6 +79,25 @@ func test_refcount_round_trip():
     mem.Free(before)
 end
 
+func test_restore_order_is_free():
+    // Two installs freed in the order that does not nest. The last Restore
+    // puts back the FIRST install's pre-block mask, so refcount zero leaves
+    // the signal unblocked; restoring the caller's copy here would leave it
+    // blocked, because every copy's mask was read after the block.
+    first := signal.Install(signal.WinchSignal, &noop_a)
+    testing.AssertNotNil(first)
+    second := signal.Install(signal.WinchSignal, &noop_a)
+    testing.AssertNotNil(second)
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, first))
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, second))
+    after := signal.CurrentMask()
+    testing.AssertTrue(not signal.IsSignal(after, signal.WinchSignal))
+    testing.AssertEqInt64(live_handler(signal.WinchSignal) as i64, 0)
+    mem.Free(after)
+    mem.Free(second)
+    mem.Free(first)
+end
+
 func test_different_handler_refused():
     first := signal.Install(signal.WinchSignal, &noop_a)
     testing.AssertNotNil(first)
@@ -110,6 +132,7 @@ end
 
 func main:
     test_refcount_round_trip()
+    test_restore_order_is_free()
     test_different_handler_refused()
     test_rebuild_after_zero()
     ret testing.Summary()
