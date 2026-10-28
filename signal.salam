@@ -120,6 +120,30 @@ end
 /// the watch is enabled on.
 pub const WinchSignal := 28
 
+@en "WaitArrived"
+/// Wait returned a signal from its set: the out-block holds its number.
+pub const WaitArrived := 1
+
+@en "WaitTimedOut"
+/// A bounded wait expired with nothing queued, so the out-block was not
+/// written. Wait never returns it; only a timed wait does.
+pub const WaitTimedOut := 0
+
+@en "WaitInvalid"
+/// A bad argument, or a platform with no signal support. Nothing was waited
+/// on.
+pub const WaitInvalid := -1
+
+@en "WaitFailed"
+/// The wait itself failed. sigwait reports failure as a positive error number
+/// and does not set errno; the out-block is untouched.
+pub const WaitFailed := -2
+
+@en "WaitBusy"
+/// Another thread in this process already owns the wait. Nothing was waited
+/// on, so the caller can retry later instead of splitting the deliveries.
+pub const WaitBusy := -3
+
 // sizeof(sigset_t): Darwin sys/_types/_sigset_t.h, OpenBSD sys/signal.h, FreeBSD sys/_sigset.h, NetBSD sys/sigtypes.h, Linux sigset headers.
 // MAC and OPENBSD must precede BSD, which also matches them.
 if SALAM_OS_WINDOWS:
@@ -230,6 +254,15 @@ if not SALAM_OS_WINDOWS:
 end
 
 if not SALAM_OS_WINDOWS:
+    // The out-block WaitWinch writes into, created on the first call and
+    // reused because the wait path may not allocate. Two threads racing that
+    // first call can each allocate one and the later pointer wins: a benign
+    // one-time double allocation, and no thread reads a block another is
+    // writing, because only the claim holder waits.
+    mut _winch_out := null as void*
+end
+
+if not SALAM_OS_WINDOWS:
     func _winch_noop(_sig: int):
         // Deliberate no-op, kept async-signal-safe. It exists only to
         // give SIGWINCH a non-default disposition; the argument is the
@@ -259,6 +292,36 @@ if not SALAM_OS_WINDOWS:
             _ := sigemptyset(((_reg as u64) + (_REG_HDR_PENDING as u64)) as void*)
         end
         ret _reg
+    end
+
+    // Test-and-set on the registry header's waiter flag: one waiter per
+    // process, so a second one is told so instead of receiving a silent
+    // subset. The lock covers the write only, never the wait itself.
+    func _claim_waiter(): bool:
+        _ := sync.Lock(_mu)
+        // No registry means no Install has run, so there is no flag to take:
+        // a program that waits before installing gets no ownership check.
+        if _reg == null:
+            _ := sync.Unlock(_mu)
+            ret true
+        end
+        flag := (_reg as u64) + (_REG_HDR_WAITER as u64)
+        busy := (flag as i32*)[0] != 0
+        if not busy:
+            (flag as i32*)[0] = 1
+        end
+        _ := sync.Unlock(_mu)
+        ret not busy
+    end
+
+    // Clear the claim. Writing 0 when the flag was never taken is harmless.
+    func _release_waiter():
+        _ := sync.Lock(_mu)
+        if _reg != null:
+            flag := (_reg as u64) + (_REG_HDR_WAITER as u64)
+            (flag as i32*)[0] = 0
+        end
+        _ := sync.Unlock(_mu)
     end
 
     // Put a captured disposition and mask back on the calling thread. The
@@ -500,21 +563,52 @@ pub func BlockWinch(): bool:
     end
 end
 
+@en "Wait"
+/// Block the calling thread until a signal in set is queued, then write its
+/// number as an i32 at out[0] and return WaitArrived. The thread must have
+/// those signals blocked, as BlockWinch does, so they queue instead of being
+/// delivered on an arbitrary thread. The out-block is caller-owned and
+/// written on arrival only, so a caller can keep its previous value after any
+/// other status. Nothing is allocated here. Returns WaitInvalid for a null set
+/// or null out and on Windows, WaitBusy when another thread already waits, and
+/// WaitFailed when the wait itself failed. Never returns WaitTimedOut, because
+/// it has no bound; one waiter per process, so two consumers cannot silently
+/// split the deliveries.
+pub func Wait(set: void*, out: void*): int:
+    if SALAM_OS_WINDOWS:
+        ret WaitInvalid
+    else:
+        if set == null or out == null: ret WaitInvalid end
+        if not _claim_waiter(): ret WaitBusy end
+        // The kernel writes the number into the caller's block on success.
+        status := sigwait(set, out)
+        // Released before any return, so a failed wait does not wedge the
+        // claim for the rest of the process.
+        _release_waiter()
+        if status == 0: ret WaitArrived end
+        ret WaitFailed
+    end
+end
+
 @en "WaitWinch"
 /// Block the calling thread until a SIGWINCH is queued, then return its
 /// signal number. The set must contain SIGWINCH, as NewWinchSet builds, and
-/// the thread must have it blocked, as BlockWinch does. Returns 0 on
-/// Windows, or when set is null, so callers can treat 0 as "nothing to do".
+/// the thread must have it blocked, as BlockWinch does. Returns 0 on Windows
+/// only, where there is no SIGWINCH; on POSIX the failure statuses are
+/// negative, so WaitInvalid replaces the old 0 for a null set, and WaitBusy
+/// means another thread already waits.
 pub func WaitWinch(set: void*): int:
     if SALAM_OS_WINDOWS:
         ret 0
     else:
-        if set == null: ret 0 end
-        sig := mem.AllocateZeroed(8 as u64)
-        _ := sigwait(set, sig)
-        n := (sig as i32*)[0]
-        mem.Free(sig)
-        ret n
+        if set == null: ret WaitInvalid end
+        if _winch_out == null:
+            _winch_out = mem.AllocateZeroed(8 as u64)
+            if _winch_out == null: ret WaitFailed end
+        end
+        status := Wait(set, _winch_out)
+        if status != WaitArrived: ret status end
+        ret (_winch_out as i32*)[0]
     end
 end
 
