@@ -26,14 +26,21 @@
  * have changed"), so the handler has nothing to record and the caller
  * re-reads the state after every wake-up.
  *
- * Installing is reversible. Install captures the calling thread's current
- * disposition for the signal and its signal mask into one zeroed heap block:
- * the first _SIGACTION_SIZE bytes take the struct sigaction the kernel fills
- * in, the next SignalSetSize bytes take the mask read before the install. The
- * caller owns that handle and frees it with mem.Free. Restore reads it and
- * never frees it, so a second Restore re-applies the same state instead of
- * reading freed memory. Handles nest: Install A then Install B must be
- * restored B then A, because B's snapshot already holds A's blocked mask.
+ * Installing is reversible, and one registry owns each signal for the whole
+ * process. The first Install for a signal captures the calling thread's
+ * current disposition and its signal mask into one zeroed heap block: the
+ * first _SIGACTION_SIZE bytes take the struct sigaction the kernel fills in,
+ * the next SignalSetSize bytes take the mask read before the install. That
+ * block is the canonical snapshot and stays in the registry; every Install
+ * returns a caller-owned copy of it, released with mem.Free, so two consumers
+ * can both free what they were given and neither holds the canonical.
+ * Further installs of the same handler only refcount; an install of a
+ * different handler while the signal is owned is refused with null, because a
+ * handler that never runs is the silent mismatch this package exists to
+ * remove. Restore puts this thread's mask back above one reference and, at
+ * the last one, restores the disposition too and frees the canonical snapshot;
+ * at zero it re-applies the same state without changing a count, so a
+ * repeated Restore is legal.
  * The mask half goes through pthread_sigmask, not sigprocmask, because
  * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
  * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
@@ -87,9 +94,10 @@ package signal
 // mem is imported only on POSIX. Every use of it lives in the POSIX halves
 // of the platform branches below; on Windows those halves are not compiled
 // and an import nothing uses is an error (E082), so the import has to go
-// away with them.
+// away with them. sync goes with it: the registry mutex is POSIX-only.
 if not SALAM_OS_WINDOWS:
     import mem
+    import sync
 end
 
 if not SALAM_OS_WINDOWS:
@@ -183,6 +191,45 @@ else:
 end
 
 if not SALAM_OS_WINDOWS:
+    // One zeroed heap block holds the registry: a header, then one slot per
+    // signal number, slot 0 unused. The registry exists so one snapshot per
+    // signal is canonical for the whole process; callers never see it.
+    //
+    // Header: the mutex handle slot at _REG_HDR_MUTEX stays reserved and
+    // unused. The live mutex is the package-level _mu, because it has to exist
+    // before the first install to serialise the registry allocation itself.
+    // The offset is named anyway so stage 03's waiter flag and stage 04's
+    // pending set keep the planned numbering. _REG_HDR_SIZE is fixed at
+    // 16 + 128, the largest sigset_t, so the slot base is the same everywhere.
+    //
+    // Slot: refs (i64), handler (u64), canonical prev (void*), then the
+    // stage-04 fields, named here so the slot size does not move later.
+    const _REG_SLOTS := 128
+    const _REG_HDR_MUTEX := 0
+    const _REG_HDR_WAITER := 8
+    const _REG_HDR_PENDING := 16
+    const _REG_HDR_SIZE := 144
+    const _REG_SLOT_SIZE := 80
+    const _REG_SLOT_REFS := 0
+    const _REG_SLOT_HANDLER := 8
+    const _REG_SLOT_PREV := 16
+    const _REG_SLOT_KQUEUE := 24
+    const _REG_SLOT_KEVENT := 32
+    const _REG_SLOT_TIMESPEC := 64
+
+    const _HANDLE_SIZE := _SIGACTION_SIZE + SignalSetSize
+
+    // Null until the first Install. Every read and write happens under _mu,
+    // except _reg == null itself, which is re-checked under the lock.
+    mut _reg := null as void*
+
+    // Serialises Install, Restore and stage 03's waiter claim. Created before
+    // main runs, so two threads racing on the first Install cannot each
+    // allocate a registry.
+    mut _mu := sync.NewMutex()
+end
+
+if not SALAM_OS_WINDOWS:
     func _winch_noop(_sig: int):
         // Deliberate no-op, kept async-signal-safe. It exists only to
         // give SIGWINCH a non-default disposition; the argument is the
@@ -190,6 +237,55 @@ if not SALAM_OS_WINDOWS:
         // comment). The discard keeps the body non-empty as the
         // compiler requires without doing any work.
         _ := _sig
+    end
+end
+
+if not SALAM_OS_WINDOWS:
+    // The slot for sig. The registry exists and sig is in range; both are the
+    // caller's check.
+    func _slot(sig: int): void*:
+        base := (_reg as u64) + (_REG_HDR_SIZE as u64)
+        ret (base + ((sig as u64) * (_REG_SLOT_SIZE as u64))) as void*
+    end
+
+    // The registry, allocated on the first call. Called under _mu, so the
+    // allocation and the pending set are not raced.
+    func _registry(): void*:
+        if _reg == null:
+            _reg = mem.AllocateZeroed((_REG_HDR_SIZE + _REG_SLOTS * _REG_SLOT_SIZE) as u64)
+            if _reg == null: ret null end
+            // Stage 04 waits on this set, so it is built here: no wait path
+            // may allocate.
+            _ := sigemptyset(((_reg as u64) + (_REG_HDR_PENDING as u64)) as void*)
+        end
+        ret _reg
+    end
+
+    // Put a captured disposition and mask back on the calling thread. The
+    // disposition goes first: a signal arriving between the two steps must
+    // meet the restored handler, not this package's no-op. The mask follows
+    // even when that failed, so a failed restore cannot leave the signal both
+    // blocked and installed.
+    func _put_back(sig: int, handle: void*): bool:
+        disposition_ok := sigaction(sig, handle, null) == 0
+        mask := ((handle as u64) + (_SIGACTION_SIZE as u64)) as void*
+        mask_ok := SetMask(mask)
+        ret disposition_ok and mask_ok
+    end
+
+    // A caller-owned copy of canonical holding this thread's mask. The
+    // sigaction bytes come from the canonical snapshot; the mask is read here,
+    // so Restore unblocks the thread that installed.
+    func _snapshot_copy(canonical: void*): void*:
+        copy := mem.AllocateZeroed(_HANDLE_SIZE as u64)
+        if copy == null: ret null end
+        mem.Copy(copy, canonical, _SIGACTION_SIZE as u64)
+        mask := ((copy as u64) + (_SIGACTION_SIZE as u64)) as void*
+        if pthread_sigmask(_SIG_BLOCK, null, mask) != 0:
+            mem.Free(copy)
+            ret null
+        end
+        ret copy
     end
 end
 
@@ -240,74 +336,149 @@ end
 @en "Install"
 /// Capture the calling thread's current disposition for sig and its signal
 /// mask, install handler with SA_RESTART and an empty sa_mask, then block sig
-/// on the calling thread. A null handler is legal and means SIG_DFL. Returns
-/// one zeroed handle holding both snapshots at the same thread: the caller
-/// owns it, releases it with mem.Free, and puts both back with Restore. Null
-/// on Windows, when sig is not positive, or when a step fails, in which case
-/// anything already changed is put back before returning.
+/// on the calling thread. A null handler is legal and means SIG_DFL. The first
+/// install for a signal does that work and keeps the snapshot in the registry;
+/// a later install of the same handler only refcounts it, and a later install
+/// of a different handler is refused, because a handler that never runs is a
+/// silent mismatch. Returns a caller-owned copy of the snapshot: release it
+/// with mem.Free and put the state back with Restore. Null on Windows, when
+/// sig is outside the table, when another handler already owns sig, or when a
+/// step fails, in which case anything already changed is put back.
 pub func Install(sig: int, handler: void*): void*:
     if SALAM_OS_WINDOWS:
         ret null
     else:
-        if sig <= 0: ret null end
-        handle := mem.AllocateZeroed((_SIGACTION_SIZE + SignalSetSize) as u64)
-        if handle == null: ret null end
-        // set == null only reads the mask into the third argument; how is
-        // ignored then, on Darwin and on Linux alike.
-        mask := ((handle as u64) + (_SIGACTION_SIZE as u64)) as void*
+        if sig <= 0 or sig >= _REG_SLOTS: ret null end
+        _ := sync.Lock(_mu)
+        if _registry() == null:
+            _ := sync.Unlock(_mu)
+            ret null
+        end
+        slot := _slot(sig)
+        refs := (slot as i64*)[0]
+        if refs > 0:
+            if (slot as u64*)[1] != (handler as u64):
+                _ := sync.Unlock(_mu)
+                ret null
+            end
+            // Same handler: this thread's mask in a fresh copy, so both
+            // consumers own their handle.
+            copy := _snapshot_copy((slot as u64*)[2] as void*)
+            if copy == null:
+                _ := sync.Unlock(_mu)
+                ret null
+            end
+            (slot as i64*)[0] = refs + 1
+            _ := sync.Unlock(_mu)
+            ret copy
+        end
+        // refs == 0: this install does the work and owns the canonical block.
+        canonical := mem.AllocateZeroed(_HANDLE_SIZE as u64)
+        if canonical == null:
+            _ := sync.Unlock(_mu)
+            ret null
+        end
+        // The mask is read before the install and before the block: it is what
+        // Restore puts back. set == null only reads the third argument.
+        mask := ((canonical as u64) + (_SIGACTION_SIZE as u64)) as void*
         if pthread_sigmask(_SIG_BLOCK, null, mask) != 0:
-            mem.Free(handle)
+            mem.Free(canonical)
+            _ := sync.Unlock(_mu)
             ret null
         end
         act := mem.AllocateZeroed(_SIGACTION_SIZE as u64)
         if act == null:
-            mem.Free(handle)
+            mem.Free(canonical)
+            _ := sync.Unlock(_mu)
             ret null
         end
         // The block is zeroed, so sa_mask is empty and the rest is SIG_DFL.
         (act as u64*)[0] = handler as u64
         (act as i32*)[_SA_FLAGS_WORD] = _SA_RESTART
-        // The kernel writes the whole previous struct at handle offset 0.
-        installed := sigaction(sig, act, handle) == 0
+        // The kernel writes the whole previous struct at canonical offset 0.
+        installed := sigaction(sig, act, canonical) == 0
         mem.Free(act)
         if not installed:
-            mem.Free(handle)
+            mem.Free(canonical)
+            _ := sync.Unlock(_mu)
             ret null
         end
         set := NewSet()
+        mut blocked := false
         if set != null:
-            if AddSignal(set, sig) and Block(set):
-                mem.Free(set)
-                ret handle
+            if AddSignal(set, sig):
+                blocked = Block(set)
             end
             mem.Free(set)
         end
-        // Put the disposition back before returning: the mask snapshot makes
-        // the recovery exact, and Restore is safe to call on a live handle.
-        Restore(sig, handle)
-        mem.Free(handle)
-        ret null
+        if not blocked:
+            // Nothing is recorded yet, so the canonical mask makes the
+            // recovery exact and the slot stays at refs == 0.
+            _ := _put_back(sig, canonical)
+            mem.Free(canonical)
+            _ := sync.Unlock(_mu)
+            ret null
+        end
+        copy := mem.AllocateZeroed(_HANDLE_SIZE as u64)
+        if copy == null:
+            _ := _put_back(sig, canonical)
+            mem.Free(canonical)
+            _ := sync.Unlock(_mu)
+            ret null
+        end
+        // The canonical mask is the pre-block mask, which is this thread's.
+        mem.Copy(copy, canonical, _HANDLE_SIZE as u64)
+        (slot as u64*)[1] = handler as u64
+        (slot as u64*)[2] = canonical as u64
+        (slot as i64*)[0] = 1
+        _ := sync.Unlock(_mu)
+        ret copy
     end
 end
 
 @en "Restore"
-/// Re-apply a disposition and mask captured by Install on the same thread,
-/// returning whether both steps succeeded. The disposition goes back first so
-/// a signal arriving between the two steps meets the restored handler, not
-/// this package's no-op. The mask follows even when the disposition restore
-/// failed, so a failed restore cannot leave the signal both blocked and
-/// installed. Frees nothing: the caller still owns prev and releases it with
-/// mem.Free, and calling Restore twice re-applies the same state. Handles
-/// nest, so restore the most recent install first.
+/// Put back the state an Install snapshot captured on the same thread,
+/// returning whether both steps succeeded. Above one reference only the
+/// calling thread's mask goes back, so the disposition stays installed. At the
+/// last reference the disposition goes back too and the registry frees its
+/// canonical snapshot. At zero references the same state is re-applied without
+/// touching a count, so a repeated Restore is legal and succeeds again.
+/// Frees nothing the caller owns.
 pub func Restore(sig: int, prev: void*): bool:
     if SALAM_OS_WINDOWS:
         ret false
     else:
         if sig <= 0 or prev == null: ret false end
-        disposition_ok := sigaction(sig, prev, null) == 0
-        mask := ((prev as u64) + (_SIGACTION_SIZE as u64)) as void*
-        mask_ok := SetMask(mask)
-        ret disposition_ok and mask_ok
+        _ := sync.Lock(_mu)
+        // Nothing was ever installed, or sig is outside the table: the handle
+        // still holds a full snapshot, so it can be re-applied on its own.
+        if _reg == null or sig >= _REG_SLOTS:
+            _ := sync.Unlock(_mu)
+            ret _put_back(sig, prev)
+        end
+        slot := _slot(sig)
+        refs := (slot as i64*)[0]
+        if refs > 1:
+            (slot as i64*)[0] = refs - 1
+            mask := ((prev as u64) + (_SIGACTION_SIZE as u64)) as void*
+            ok := SetMask(mask)
+            _ := sync.Unlock(_mu)
+            ret ok
+        end
+        if refs == 1:
+            (slot as i64*)[0] = 0
+            ok := _put_back(sig, prev)
+            // refs reached zero, so the canonical snapshot goes; a later
+            // install rebuilds it. The caller's copy is untouched.
+            mem.Free((slot as u64*)[2] as void*)
+            (slot as u64*)[1] = 0
+            (slot as u64*)[2] = 0
+            _ := sync.Unlock(_mu)
+            ret ok
+        end
+        // refs == 0: idempotent, no count change, nothing to free.
+        _ := sync.Unlock(_mu)
+        ret _put_back(sig, prev)
     end
 end
 
