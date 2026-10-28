@@ -52,7 +52,10 @@ end
 // The SIGWINCH disposition currently installed, read back the same way the
 // returned handle is: offset 0 of a struct sigaction is the handler word.
 func live_handler(sig: int): u64:
-    buf := mem.AllocateZeroed(16 as u64)
+    // struct sigaction is 16 bytes on Darwin but 152 on glibc, and the kernel
+    // writes the whole struct: the block is sized for the largest target, not
+    // the one this test happens to run on.
+    buf := mem.AllocateZeroed(256 as u64)
     if buf == null: ret 0 end
     _ := sigaction(sig, null, buf)
     handler := (buf as u64*)[0]

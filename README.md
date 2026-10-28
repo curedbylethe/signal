@@ -9,8 +9,9 @@ The package owns the process-wide handler and the blocked signal mask, and
 nothing else: no terminal state, no policy, no widget code.
 
 > **Status: early development.** `v0.1.1` shipped the signal-set API. The
-> disposition and wait API (`Install`, `Restore`, `Wait`, `WaitTimeout`) is on
-> `main` and unreleased; Windows is a documented stub. Hardening is tracked
+> disposition and wait API (`Install`, `Restore`, `Wait`, `WaitTimeout`) is
+> unreleased: it lands with the stacked capture-and-restore branch and is not
+> on `main` yet. Windows is a documented stub. Hardening is tracked
 > separately.
 
 ## Install
@@ -100,7 +101,8 @@ install of a handler does the work, a later install of the same handler only
 refcounts, and a later install of a *different* handler is refused with null —
 a handler that never runs is the failure this package exists to prevent. Each
 `Install` returns a caller-owned copy, so both consumers can free what they
-were given; the last `Restore` puts the disposition and the mask back. One
+were given; the last `Restore` puts the first install's disposition and mask
+back, whichever order the handles are freed in. One
 waiter at a time, too: a second concurrent `Wait` or `WaitTimeout` returns
 `WaitBusy` rather than silently receiving a subset of the deliveries, so a
 consumer retries instead of splitting them.
@@ -154,7 +156,7 @@ end
 | `WaitTimeout` | `Wait` with a bound in milliseconds: `WaitTimedOut` when the bound wins and `out` untouched, `millis` 0 probes once, negative is `WaitInvalid`; one signal per call on Darwin, any set on Linux, `WaitInvalid` on the other POSIX targets |
 | `WaitWinch` | Park until `SIGWINCH` is queued and return its number, or a negative status; `0` on Windows only |
 | `WakeWinch` | Send `SIGWINCH` to this process to break the wait; false on Windows or when the call failed |
-| `Restore` | Put a saved disposition and mask back: above one reference only the calling thread's mask, at the last reference both, and after that the same state again without touching a count; false when the handle is null or a step failed |
+| `Restore` | Put the captured state back: above one reference the calling thread's mask, at the last reference the first install's disposition and mask — either order leaves the signal unblocked — and after that the same state again without touching a count; false when the handle is null or a step failed |
 
 ### Wait status
 

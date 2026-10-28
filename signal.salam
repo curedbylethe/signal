@@ -37,10 +37,11 @@
  * Further installs of the same handler only refcount; an install of a
  * different handler while the signal is owned is refused with null, because a
  * handler that never runs is the silent mismatch this package exists to
- * remove. Restore puts this thread's mask back above one reference and, at
- * the last one, restores the disposition too and frees the canonical snapshot;
- * at zero it re-applies the same state without changing a count, so a
- * repeated Restore is legal.
+ * remove. Restore puts this thread's mask back above one reference and, at the
+ * last one, puts back the state the first Install captured — disposition and
+ * mask both, whichever order the handles are freed in — then frees the
+ * canonical snapshot; at zero it re-applies the same state without changing a
+ * count, so a repeated Restore is legal.
  * The mask half goes through pthread_sigmask, not sigprocmask, because
  * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
  * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
@@ -300,9 +301,12 @@ if not SALAM_OS_WINDOWS:
     const _REG_HDR_PENDING := 16
     const _REG_HDR_SIZE := 144
     const _REG_SLOT_SIZE := 80
+    // The three live fields are word indices into the slot, so the read and
+    // the layout cannot drift apart. The stage-04 fields below are byte
+    // offsets because they carve one blob.
     const _REG_SLOT_REFS := 0
-    const _REG_SLOT_HANDLER := 8
-    const _REG_SLOT_PREV := 16
+    const _REG_SLOT_HANDLER := 1
+    const _REG_SLOT_PREV := 2
     const _REG_SLOT_KQUEUE := 24
     const _REG_SLOT_KEVENT := 32
     const _REG_SLOT_TIMESPEC := 64
@@ -505,20 +509,20 @@ pub func Install(sig: int, handler: void*): void*:
             ret null
         end
         slot := _slot(sig)
-        refs := (slot as i64*)[0]
+        refs := (slot as i64*)[_REG_SLOT_REFS]
         if refs > 0:
-            if (slot as u64*)[1] != (handler as u64):
+            if (slot as u64*)[_REG_SLOT_HANDLER] != (handler as u64):
                 _ := sync.Unlock(_mu)
                 ret null
             end
             // Same handler: this thread's mask in a fresh copy, so both
             // consumers own their handle.
-            copy := _snapshot_copy((slot as u64*)[2] as void*)
+            copy := _snapshot_copy((slot as u64*)[_REG_SLOT_PREV] as void*)
             if copy == null:
                 _ := sync.Unlock(_mu)
                 ret null
             end
-            (slot as i64*)[0] = refs + 1
+            (slot as i64*)[_REG_SLOT_REFS] = refs + 1
             _ := sync.Unlock(_mu)
             ret copy
         end
@@ -603,14 +607,19 @@ pub func Install(sig: int, handler: void*): void*:
         if copy == null:
             _ := _put_back(sig, canonical)
             mem.Free(canonical)
+            if SALAM_OS_MAC:
+                // Registered, never used: the slot will not keep it, so it
+                // cannot be closed by a later Restore.
+                _ := close((((slot as u64) + (_REG_SLOT_KQUEUE as u64)) as i64*)[0] as int)
+            end
             _ := sync.Unlock(_mu)
             ret null
         end
         // The canonical mask is the pre-block mask, which is this thread's.
         mem.Copy(copy, canonical, _HANDLE_SIZE as u64)
-        (slot as u64*)[1] = handler as u64
-        (slot as u64*)[2] = canonical as u64
-        (slot as i64*)[0] = 1
+        (slot as u64*)[_REG_SLOT_HANDLER] = handler as u64
+        (slot as u64*)[_REG_SLOT_PREV] = canonical as u64
+        (slot as i64*)[_REG_SLOT_REFS] = 1
         _ := sync.Unlock(_mu)
         ret copy
     end
@@ -620,9 +629,11 @@ end
 /// Put back the state an Install snapshot captured on the same thread,
 /// returning whether both steps succeeded. Above one reference only the
 /// calling thread's mask goes back, so the disposition stays installed. At the
-/// last reference the disposition goes back too and the registry frees its
-/// canonical snapshot. At zero references the same state is re-applied without
-/// touching a count, so a repeated Restore is legal and succeeds again.
+/// last reference the state the *first* Install captured goes back in full —
+/// both the disposition and that mask — so freeing handles in either order
+/// leaves the signal unblocked. The registry then frees its canonical
+/// snapshot. At zero references the same state is re-applied without touching
+/// a count, so a repeated Restore is legal and succeeds again.
 /// Frees nothing the caller owns.
 pub func Restore(sig: int, prev: void*): bool:
     if SALAM_OS_WINDOWS:
@@ -637,29 +648,35 @@ pub func Restore(sig: int, prev: void*): bool:
             ret _put_back(sig, prev)
         end
         slot := _slot(sig)
-        refs := (slot as i64*)[0]
+        refs := (slot as i64*)[_REG_SLOT_REFS]
         if refs > 1:
-            (slot as i64*)[0] = refs - 1
+            (slot as i64*)[_REG_SLOT_REFS] = refs - 1
             mask := ((prev as u64) + (_SIGACTION_SIZE as u64)) as void*
             ok := SetMask(mask)
             _ := sync.Unlock(_mu)
             ret ok
         end
         if refs == 1:
-            (slot as i64*)[0] = 0
-            ok := _put_back(sig, prev)
+            (slot as i64*)[_REG_SLOT_REFS] = 0
+            // The last Restore puts back the state the *first* Install
+            // captured, not the caller's copy: every copy's mask was read
+            // after the signal was blocked, so restoring a copy would leave
+            // the signal blocked at refcount zero for a caller that frees its
+            // handles in the other order.
+            canonical := (slot as u64*)[_REG_SLOT_PREV] as void*
+            ok := _put_back(sig, canonical)
             // refs reached zero, so the canonical snapshot goes; a later
             // install rebuilds it. The caller's copy is untouched.
-            mem.Free((slot as u64*)[2] as void*)
-            (slot as u64*)[1] = 0
-            (slot as u64*)[2] = 0
+            mem.Free((slot as u64*)[_REG_SLOT_PREV] as void*)
+            (slot as u64*)[_REG_SLOT_HANDLER] = 0
+            (slot as u64*)[_REG_SLOT_PREV] = 0
             if SALAM_OS_MAC:
                 // A kqueue is a descriptor, so it goes with the snapshot: kept
                 // past this point, every install/restore cycle leaks one.
                 kq := ((slot as u64) + (_REG_SLOT_KQUEUE as u64)) as i64*
-                if kq[0] > 0:
+                if kq[0] >= 0:
                     _ := close(kq[0] as int)
-                    kq[0] = 0
+                    kq[0] = -1
                 end
             end
             _ := sync.Unlock(_mu)
