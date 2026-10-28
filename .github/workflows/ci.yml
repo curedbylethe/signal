@@ -20,3 +20,33 @@ jobs:
       - run: salam version
       - run: make check
       - run: make test-llvm
+
+  abi-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc  # v1.5.9
+        with:
+          release: "14.5"
+          usesh: true
+          run: cc -o /tmp/abi ci/sigaction_offsets.c && /tmp/abi
+
+  abi-netbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92  # v1.5.2
+        with:
+          release: "10.2"
+          usesh: true
+          run: cc -o /tmp/abi ci/sigaction_offsets.c && /tmp/abi
+
+  abi-openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: vmactions/openbsd-vm@f1ca8bc8ecc5b6ef7218e5b914836e067e1546d3  # v1.4.9
+        with:
+          release: "7.9"
+          usesh: true
+          run: cc -o /tmp/abi ci/sigaction_offsets.c && /tmp/abi

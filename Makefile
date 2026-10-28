@@ -11,14 +11,15 @@ ifeq ($(shell uname -s),Darwin)
 export MACOSX_DEPLOYMENT_TARGET ?= $(shell sw_vers -productVersion)
 endif
 
-.PHONY: help build test test-llvm format check clean
+.PHONY: help build test test-llvm format check check-abi clean
 
 help:
 	@echo "make build     compile a consumer of signal.salam with --backend=llvm"
 	@echo "make test      build and run the test suite (tests/run.sh)"
 	@echo "make test-llvm build and run the test suite with --backend=llvm"
 	@echo "make format    format all Salam sources in place"
-	@echo "make check     format check, build and tests (the library gate; CI also runs test-llvm)"
+	@echo "make check     format check, ABI oracle, build and tests (the library gate; CI also runs test-llvm)"
+	@echo "make check-abi compile and run the sigaction layout oracle against this host"
 	@echo "make clean     remove build output"
 
 build:
@@ -37,7 +38,13 @@ format:
 
 check:
 	$(SALAM) format --check $(SOURCES)
+	$(MAKE) check-abi
 	$(MAKE) build test
+
+check-abi:
+	@mkdir -p $(BUILD)
+	cc -std=c11 -Wall -Wextra -o $(BUILD)/sigaction_offsets ci/sigaction_offsets.c
+	$(BUILD)/sigaction_offsets
 
 clean:
 	rm -rf $(BUILD) .salam-build
