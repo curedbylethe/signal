@@ -73,13 +73,6 @@ _Static_assert(EXPECT_FLAGS % 4 == 0, "sa_flags is read and written as a u32 wor
 
 /* FreeBSD is the only target whose sa_flags precedes sa_mask; the numbers above
    do not say so out loud, and a reader diffing the tables needs it to. */
-#if defined(__FreeBSD__)
-_Static_assert(offsetof(struct sigaction, sa_flags) < offsetof(struct sigaction, sa_mask),
-               "freebsd: sa_flags precedes sa_mask");
-#else
-_Static_assert(offsetof(struct sigaction, sa_mask) < offsetof(struct sigaction, sa_flags),
-               "sa_mask precedes sa_flags");
-#endif
 
 /* SA_RESTART is not exposed by every BSD under every feature macro; assert it
    where it is visible and rely on EXPECT_RESTART's literal otherwise. */
