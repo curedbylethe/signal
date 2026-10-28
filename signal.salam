@@ -26,6 +26,37 @@
  * have changed"), so the handler has nothing to record and the caller
  * re-reads the state after every wake-up.
  *
+ * Installing is reversible. Install captures the calling thread's current
+ * disposition for the signal and its signal mask into one zeroed heap block:
+ * the first _SIGACTION_SIZE bytes take the struct sigaction the kernel fills
+ * in, the next SignalSetSize bytes take the mask read before the install. The
+ * caller owns that handle and frees it with mem.Free. Restore reads it and
+ * never frees it, so a second Restore re-applies the same state instead of
+ * reading freed memory. Handles nest: Install A then Install B must be
+ * restored B then A, because B's snapshot already holds A's blocked mask.
+ * Install blocks the signal on the calling thread as its last step, after the
+ * disposition is in place: a signal blocked while SIG_DFL is still installed
+ * is discarded at generation on Darwin, so the other order loses it.
+ *
+ * Every POSIX target installs through sigaction, never signal(). Salam has no
+ * C struct here, so the struct sigaction is a zeroed byte block written
+ * through named offsets, one branch per target: Darwin, Linux, FreeBSD,
+ * NetBSD and OpenBSD. FreeBSD is the only target where sa_flags precedes
+ * sa_mask. ci/sigaction_offsets.c proves the numbers with _Static_asserts
+ * against each platform's real headers and a sigaction round trip. Salam has
+ * no BSD port, so the BSD branches are proven by that oracle and reviewed,
+ * not compiled. Only SA_RESTART is set, sa_mask stays empty and no restorer
+ * is written.
+ *
+ * Async-signal-safety contract for any handler passed to Install: it runs on
+ * the thread that took the signal, and it may call async-signal-safe
+ * functions only. No allocation, no locks, no stdio, no calls into the Salam
+ * runtime: its allocator, its prints and its data structures are all unsafe
+ * there. It may touch only volatile sig_atomic_t, lock-free atomics or
+ * read-only data; it must save errno on entry and restore it before
+ * returning; and it must not assume this package, or anything else it calls,
+ * is reentrant. The no-op below meets the contract by doing nothing.
+ *
  * Deliberate non-goals. No handler body: the handler runs on the delivery
  * thread and must stay async-signal-safe. No sigtimedwait (absent on macOS)
  * and no SIGALRM timeouts. Sets are built and edited by libc's sigemptyset,
@@ -41,10 +72,10 @@
  * every function is safe to call and WinchSupported reports false so callers
  * can fall back to polling.
  *
- * Two public surfaces. SIGWINCH: WinchSignal, WinchSupported, NewWinchSet,
- * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch. Signal sets:
- * SignalSetSize, NewSet, FillSet, AddSignal, DelSignal, IsSignal, Block,
- * Unblock, SetMask.
+ * Three public surfaces. SIGWINCH: WinchSignal, WinchSupported, NewWinchSet,
+ * InstallWinchHandler, BlockWinch, WaitWinch, WakeWinch. Disposition: Install,
+ * Restore, CurrentMask. Signal sets: SignalSetSize, NewSet, FillSet,
+ * AddSignal, DelSignal, IsSignal, Block, Unblock, SetMask.
  */
 
 package signal
@@ -59,7 +90,7 @@ end
 
 if not SALAM_OS_WINDOWS:
     extern:
-        func signal(sig: int, handler: void*): void*
+        func sigaction(sig: int, act: void*, old: void*): int
         func sigprocmask(how: int, set: void*, old: void*): int
         func sigemptyset(set: void*): int
         func sigfillset(set: void*): int
@@ -115,16 +146,46 @@ else:
     const _SIG_SETMASK := 2
 end
 
+// struct sigaction: sys/signal.h on Darwin, OpenBSD, NetBSD and FreeBSD,
+// bits/sigaction.h in glibc and musl. _SA_FLAGS_WORD is the u32 index of the
+// flags byte, because the zeroed block is written through typed pointers.
+// FreeBSD is the only target that puts sa_flags before sa_mask. MAC, OPENBSD
+// and NETBSD must precede BSD, which also matches them, or NetBSD silently
+// takes FreeBSD's layout and SA_RESTART lands in its mask.
+if SALAM_OS_WINDOWS:
+    const _SIGACTION_SIZE := 0 // no sigaction on Windows
+    const _SA_FLAGS_WORD := 0
+    const _SA_RESTART := 0
+else SALAM_OS_MAC:
+    const _SIGACTION_SIZE := 16 // sys/signal.h: handler 0, mask 8 (4 B), flags 12
+    const _SA_FLAGS_WORD := 3 // u32 index of byte 12
+    const _SA_RESTART := 0x0002
+else SALAM_OS_OPENBSD:
+    const _SIGACTION_SIZE := 16 // sys/signal.h: handler 0, mask 8 (4 B), flags 12
+    const _SA_FLAGS_WORD := 3 // u32 index of byte 12
+    const _SA_RESTART := 0x0002
+else SALAM_OS_NETBSD:
+    const _SIGACTION_SIZE := 32 // sys/signal.h: handler 0, mask 8 (16 B), flags 24
+    const _SA_FLAGS_WORD := 6 // u32 index of byte 24
+    const _SA_RESTART := 0x0002
+else SALAM_OS_BSD:
+    const _SIGACTION_SIZE := 32 // FreeBSD sys/signal.h: handler 0, flags 8, mask 12 (16 B)
+    const _SA_FLAGS_WORD := 2 // u32 index of byte 8
+    const _SA_RESTART := 0x0002
+else:
+    const _SIGACTION_SIZE := 152 // glibc/musl bits/sigaction.h: mask 8-135, flags 136, restorer 144
+    const _SA_FLAGS_WORD := 34 // u32 index of byte 136
+    const _SA_RESTART := 0x10000000
+end
+
 if not SALAM_OS_WINDOWS:
-    export:
-        func winch_noop(_sig: int):
-            // Deliberate no-op, kept async-signal-safe. It exists only to
-            // give SIGWINCH a non-default disposition; the argument is the
-            // signal number and carries no information (see the module
-            // comment). The discard keeps the body non-empty as the
-            // compiler requires without doing any work.
-            _ := _sig
-        end
+    func _winch_noop(_sig: int):
+        // Deliberate no-op, kept async-signal-safe. It exists only to
+        // give SIGWINCH a non-default disposition; the argument is the
+        // signal number and carries no information (see the module
+        // comment). The discard keeps the body non-empty as the
+        // compiler requires without doing any work.
+        _ := _sig
     end
 end
 
@@ -142,23 +203,99 @@ end
 
 @en "NewWinchSet"
 /// Allocate a signal set containing SIGWINCH and nothing else. The caller
-/// owns the memory and releases it with mem.Free. Returns null on Windows.
+/// owns the memory and releases it with mem.Free. Returns null on Windows,
+/// when the allocation fails, or when SIGWINCH cannot be added.
 pub func NewWinchSet(): void*:
     set := NewSet()
-    _ := AddSignal(set, WinchSignal)
+    if set == null: ret null end
+    if not AddSignal(set, WinchSignal):
+        mem.Free(set)
+        ret null
+    end
     ret set
 end
 
 @en "InstallWinchHandler"
-/// Install the process-wide no-op SIGWINCH handler. Call this before
-/// BlockWinch: a signal blocked while its disposition is still SIG_DFL is
-/// discarded at generation on Darwin, so the handler must exist first. A
-/// no-op on Windows.
-pub func InstallWinchHandler():
+/// Install the process-wide no-op SIGWINCH handler with SA_RESTART and an
+/// empty mask, then block SIGWINCH on the calling thread. Returns the
+/// previous disposition and mask, owned by the caller: pass it to Restore, or
+/// free it with mem.Free. Null on Windows and when the install fails, in
+/// which case nothing is left changed. A no-op on Windows.
+pub func InstallWinchHandler(): void*:
+    ret Install(WinchSignal, &_winch_noop)
+end
+
+@en "Install"
+/// Capture the calling thread's current disposition for sig and its signal
+/// mask, install handler with SA_RESTART and an empty sa_mask, then block sig
+/// on the calling thread. A null handler is legal and means SIG_DFL. Returns
+/// one zeroed handle holding both snapshots at the same thread: the caller
+/// owns it, releases it with mem.Free, and puts both back with Restore. Null
+/// on Windows, when sig is not positive, or when a step fails, in which case
+/// anything already changed is put back before returning.
+pub func Install(sig: int, handler: void*): void*:
     if SALAM_OS_WINDOWS:
-        ret
+        ret null
     else:
-        _ := signal(WinchSignal, &winch_noop)
+        if sig <= 0: ret null end
+        handle := mem.AllocateZeroed((_SIGACTION_SIZE + SignalSetSize) as u64)
+        if handle == null: ret null end
+        // set == null only reads the mask into the third argument; how is
+        // ignored then, on Darwin and on Linux alike.
+        mask := ((handle as u64) + (_SIGACTION_SIZE as u64)) as void*
+        if sigprocmask(_SIG_BLOCK, null, mask) != 0:
+            mem.Free(handle)
+            ret null
+        end
+        act := mem.AllocateZeroed(_SIGACTION_SIZE as u64)
+        if act == null:
+            mem.Free(handle)
+            ret null
+        end
+        // The block is zeroed, so sa_mask is empty and the rest is SIG_DFL.
+        (act as u64*)[0] = handler as u64
+        (act as i32*)[_SA_FLAGS_WORD] = _SA_RESTART
+        // The kernel writes the whole previous struct at handle offset 0.
+        installed := sigaction(sig, act, handle) == 0
+        mem.Free(act)
+        if not installed:
+            mem.Free(handle)
+            ret null
+        end
+        set := NewSet()
+        if set != null:
+            if AddSignal(set, sig) and Block(set):
+                mem.Free(set)
+                ret handle
+            end
+            mem.Free(set)
+        end
+        // Put the disposition back before returning: the mask snapshot makes
+        // the recovery exact, and Restore is safe to call on a live handle.
+        Restore(sig, handle)
+        mem.Free(handle)
+        ret null
+    end
+end
+
+@en "Restore"
+/// Re-apply a disposition and mask captured by Install on the same thread,
+/// returning whether both steps succeeded. The disposition goes back first so
+/// a signal arriving between the two steps meets the restored handler, not
+/// this package's no-op. The mask follows even when the disposition restore
+/// failed, so a failed restore cannot leave the signal both blocked and
+/// installed. Frees nothing: the caller still owns prev and releases it with
+/// mem.Free, and calling Restore twice re-applies the same state. Handles
+/// nest, so restore the most recent install first.
+pub func Restore(sig: int, prev: void*): bool:
+    if SALAM_OS_WINDOWS:
+        ret false
+    else:
+        if sig <= 0 or prev == null: ret false end
+        disposition_ok := sigaction(sig, prev, null) == 0
+        mask := ((prev as u64) + (_SIGACTION_SIZE as u64)) as void*
+        mask_ok := SetMask(mask)
+        ret disposition_ok and mask_ok
     end
 end
 
@@ -166,14 +303,17 @@ end
 /// Add SIGWINCH to the calling thread's signal mask so the signal is queued
 /// for WaitWinch instead of delivered on an arbitrary thread. Threads
 /// spawned afterwards inherit the mask, which is what lets one dedicated
-/// watcher thread own the wait. A no-op on Windows.
-pub func BlockWinch():
+/// watcher thread own the wait. False on Windows, when the set could not be
+/// built, or when blocking failed.
+pub func BlockWinch(): bool:
     if SALAM_OS_WINDOWS:
-        ret
+        ret false
     else:
         set := NewWinchSet()
-        Block(set)
+        if set == null: ret false end
+        blocked := Block(set)
         mem.Free(set)
+        ret blocked
     end
 end
 
@@ -198,13 +338,13 @@ end
 @en "WakeWinch"
 /// Send SIGWINCH to this process so a thread parked in WaitWinch wakes up.
 /// With the signal blocked this only queues it, which is exactly what the
-/// watcher consumes; Screen uses it to break the wait when shutting down. A
-/// no-op on Windows.
-pub func WakeWinch():
+/// watcher consumes; Screen uses it to break the wait when shutting down.
+/// False on Windows or when kill failed.
+pub func WakeWinch(): bool:
     if SALAM_OS_WINDOWS:
-        ret
+        ret false
     else:
-        _ := kill(getpid(), WinchSignal)
+        ret kill(getpid(), WinchSignal) == 0
     end
 end
 
@@ -277,39 +417,57 @@ end
 
 @en "Block"
 /// Add set to the calling thread's signal mask so its signals queue instead
-/// of being delivered. A no-op when set is null and on Windows.
-pub func Block(set: void*):
+/// of being delivered. False when set is null, on Windows, or when the mask
+/// could not be changed.
+pub func Block(set: void*): bool:
     if SALAM_OS_WINDOWS:
-        ret
+        ret false
     else:
-        if set == null: ret end
-        // Fails only on a bad how; _SIG_BLOCK is fixed per platform above.
-        _ := sigprocmask(_SIG_BLOCK, set, null)
+        if set == null: ret false end
+        ret sigprocmask(_SIG_BLOCK, set, null) == 0
     end
 end
 
 @en "Unblock"
-/// Remove set from the calling thread's signal mask. A no-op when set is
-/// null and on Windows.
-pub func Unblock(set: void*):
+/// Remove set from the calling thread's signal mask. False when set is null,
+/// on Windows, or when the mask could not be changed.
+pub func Unblock(set: void*): bool:
     if SALAM_OS_WINDOWS:
-        ret
+        ret false
     else:
-        if set == null: ret end
-        // Fails only on a bad how; _SIG_UNBLOCK is fixed per platform above.
-        _ := sigprocmask(_SIG_UNBLOCK, set, null)
+        if set == null: ret false end
+        ret sigprocmask(_SIG_UNBLOCK, set, null) == 0
     end
 end
 
 @en "SetMask"
-/// Replace the calling thread's signal mask with set. A no-op when set is
-/// null and on Windows.
-pub func SetMask(set: void*):
+/// Replace the calling thread's signal mask with set. False when set is null,
+/// on Windows, or when the mask could not be changed.
+pub func SetMask(set: void*): bool:
     if SALAM_OS_WINDOWS:
-        ret
+        ret false
     else:
-        if set == null: ret end
-        // Fails only on a bad how; _SIG_SETMASK is fixed per platform above.
-        _ := sigprocmask(_SIG_SETMASK, set, null)
+        if set == null: ret false end
+        ret sigprocmask(_SIG_SETMASK, set, null) == 0
+    end
+end
+
+@en "CurrentMask"
+/// Allocate a set holding the calling thread's current signal mask. The
+/// caller owns the memory and releases it with mem.Free, like every other set
+/// in this package. Returns null on Windows and when the mask could not be
+/// read.
+pub func CurrentMask(): void*:
+    if SALAM_OS_WINDOWS:
+        ret null
+    else:
+        set := NewSet()
+        if set == null: ret null end
+        // set == null is what selects "read only"; how is ignored then.
+        if sigprocmask(_SIG_BLOCK, null, set) != 0:
+            mem.Free(set)
+            ret null
+        end
+        ret set
     end
 end
