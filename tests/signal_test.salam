@@ -20,6 +20,13 @@ import mem
 
 include "../signal.salam"
 
+// The SIGWINCH disposition read back at offset 0 of a struct sigaction is the
+// handler word. The extern is declared here because the package keeps its own
+// one private. It has to sit with the imports, before any other declaration.
+extern:
+    func sigaction(sig: int, act: void*, old: void*): int
+end
+
 // How many SIGWINCHes the watcher thread consumed. Written by the watcher,
 // read by main after join (which orders the two), so no locking is needed
 // and the assertions stay on the main thread.
@@ -32,14 +39,25 @@ func watcher(set: void*):
 end
 
 // Two distinct handlers for the install/restore round trip: the second
-// install must report the first one as the previous disposition. The
-// discard keeps the body non-empty, as the compiler requires.
+// install must be refused while the first one owns the signal. The discard
+// keeps the body non-empty, as the compiler requires.
 func noop_one(_sig: int):
     _ := _sig
 end
 
 func noop_two(_sig: int):
     _ := _sig
+end
+
+// The SIGWINCH disposition currently installed, read back the same way the
+// returned handle is: offset 0 of a struct sigaction is the handler word.
+func live_handler(sig: int): u64:
+    buf := mem.AllocateZeroed(16 as u64)
+    if buf == null: ret 0 end
+    _ := sigaction(sig, null, buf)
+    handler := (buf as u64*)[0]
+    mem.Free(buf)
+    ret handler
 end
 
 func test_supported():
@@ -54,29 +72,33 @@ func test_install_restore():
     testing.AssertNotNil(before)
     prev1 := signal.Install(signal.WinchSignal, &noop_one)
     testing.AssertNotNil(prev1)
-    // Offset 0 is the handler word in every POSIX struct sigaction, and the
-    // first install's previous disposition was SIG_DFL, whose pointer is 0.
-    testing.AssertEqInt64((prev1 as u64*)[0] as i64, 0)
+    // A different handler while noop_one owns the signal is refused rather
+    // than silently installed: it would never run.
     prev2 := signal.Install(signal.WinchSignal, &noop_two)
-    testing.AssertNotNil(prev2)
-    // Layout pin: the second handle captured the handler the first install
-    // put in place.
-    testing.AssertTrue(((prev2 as u64*)[0]) == ((&noop_one) as u64))
-    // Most recent install first. Restore frees nothing, so restoring the
-    // same handle twice is legal and succeeds again.
-    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev2))
-    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev1))
+    testing.AssertTrue(prev2 == null)
+    // The refusal changed nothing: noop_one is still the live disposition.
+    testing.AssertTrue(live_handler(signal.WinchSignal) == (&noop_one) as u64)
+    // The same handler refcounts and hands back its own copy. Restoring that
+    // one drops the count to one, so the mask stays blocked and the
+    // disposition stays installed: a consumer still owns the signal.
+    prev3 := signal.Install(signal.WinchSignal, &noop_one)
+    testing.AssertNotNil(prev3)
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev3))
+    held := signal.CurrentMask()
+    testing.AssertTrue(signal.IsSignal(held, signal.WinchSignal))
+    testing.AssertTrue(live_handler(signal.WinchSignal) == (&noop_one) as u64)
+    // The last reference restores the mask and the disposition.
     testing.AssertTrue(signal.Restore(signal.WinchSignal, prev1))
     after := signal.CurrentMask()
-    testing.AssertNotNil(after)
-    // The mask is back to what it was: one blocked candidate, one clean
-    // signal, one never touched.
     testing.AssertEqBool(signal.IsSignal(after, signal.WinchSignal), signal.IsSignal(before, signal.WinchSignal))
-    testing.AssertEqBool(signal.IsSignal(after, 15), signal.IsSignal(before, 15))
-    testing.AssertEqBool(signal.IsSignal(after, 1), signal.IsSignal(before, 1))
-    mem.Free(prev2)
-    mem.Free(prev1)
+    testing.AssertEqInt64(live_handler(signal.WinchSignal) as i64, 0)
+    // At refcount zero Restore is idempotent: it re-applies the same state,
+    // frees nothing, and changes no count.
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev1))
+    mem.Free(held)
     mem.Free(after)
+    mem.Free(prev3)
+    mem.Free(prev1)
     mem.Free(before)
 end
 
