@@ -31,9 +31,53 @@ func watcher(set: void*):
     end
 end
 
+// Two distinct handlers for the install/restore round trip: the second
+// install must report the first one as the previous disposition. The
+// discard keeps the body non-empty, as the compiler requires.
+func noop_one(_sig: int):
+    _ := _sig
+end
+
+func noop_two(_sig: int):
+    _ := _sig
+end
+
 func test_supported():
     // CI runs ubuntu and macos only, both POSIX, so the watch is available.
     testing.AssertTrue(signal.WinchSupported())
+end
+
+func test_install_restore():
+    // Runs second in main, before anything installs a handler or blocks
+    // SIGWINCH, so the first install still sees the default disposition.
+    before := signal.CurrentMask()
+    testing.AssertNotNil(before)
+    prev1 := signal.Install(signal.WinchSignal, &noop_one)
+    testing.AssertNotNil(prev1)
+    // Offset 0 is the handler word in every POSIX struct sigaction, and the
+    // first install's previous disposition was SIG_DFL, whose pointer is 0.
+    testing.AssertEqInt64((prev1 as u64*)[0] as i64, 0)
+    prev2 := signal.Install(signal.WinchSignal, &noop_two)
+    testing.AssertNotNil(prev2)
+    // Layout pin: the second handle captured the handler the first install
+    // put in place.
+    testing.AssertTrue(((prev2 as u64*)[0]) == ((&noop_one) as u64))
+    // Most recent install first. Restore frees nothing, so restoring the
+    // same handle twice is legal and succeeds again.
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev2))
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev1))
+    testing.AssertTrue(signal.Restore(signal.WinchSignal, prev1))
+    after := signal.CurrentMask()
+    testing.AssertNotNil(after)
+    // The mask is back to what it was: one blocked candidate, one clean
+    // signal, one never touched.
+    testing.AssertEqBool(signal.IsSignal(after, signal.WinchSignal), signal.IsSignal(before, signal.WinchSignal))
+    testing.AssertEqBool(signal.IsSignal(after, 15), signal.IsSignal(before, 15))
+    testing.AssertEqBool(signal.IsSignal(after, 1), signal.IsSignal(before, 1))
+    mem.Free(prev2)
+    mem.Free(prev1)
+    mem.Free(after)
+    mem.Free(before)
 end
 
 func test_blocked_self_signal_is_consumed():
@@ -84,6 +128,7 @@ end
 
 func main:
     test_supported()
+    test_install_restore()
     test_blocked_self_signal_is_consumed()
     test_thread_inherits_mask()
     test_set_membership()
