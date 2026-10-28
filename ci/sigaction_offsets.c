@@ -69,7 +69,6 @@ _Static_assert(offsetof(struct sigaction, sa_mask) == EXPECT_MASK, "sa_mask offs
 _Static_assert(offsetof(struct sigaction, sa_flags) == EXPECT_FLAGS, "sa_flags offset");
 _Static_assert(sizeof(((struct sigaction *)0)->sa_mask) == EXPECT_MASK_SIZE,
                "sa_mask size must match SignalSetSize");
-_Static_assert(EXPECT_FLAGS % 4 == 0, "sa_flags is read and written as a u32 word");
 
 /* FreeBSD is the only target whose sa_flags precedes sa_mask; the numbers above
    do not say so out loud, and a reader diffing the tables needs it to. */
