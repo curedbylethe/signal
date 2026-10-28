@@ -3,7 +3,7 @@
 SALAM ?= salam
 BUILD := build
 FLAGS := --log-level=warn --backend=llvm
-SOURCES := signal.salam tests
+SOURCES := signal.salam tests ci
 
 # Salam links with the host toolchain on macOS. Pin the deployment target to
 # the running OS so the linker does not warn about mismatched SDK versions.
