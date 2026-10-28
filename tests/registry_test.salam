@@ -89,6 +89,11 @@ func test_restore_order_is_free():
     second := signal.Install(signal.WinchSignal, &noop_a)
     testing.AssertNotNil(second)
     testing.AssertTrue(signal.Restore(signal.WinchSignal, first))
+    // One owner is left, so the signal must still be blocked: unblocking here
+    // would let a raise run the handler instead of queueing for its wait.
+    mid := signal.CurrentMask()
+    testing.AssertTrue(signal.IsSignal(mid, signal.WinchSignal))
+    mem.Free(mid)
     testing.AssertTrue(signal.Restore(signal.WinchSignal, second))
     after := signal.CurrentMask()
     testing.AssertTrue(not signal.IsSignal(after, signal.WinchSignal))
