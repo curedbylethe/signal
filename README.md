@@ -141,9 +141,10 @@ signal-set API is part of `v0.1.1`.
 
 ## Contributing
 
-`make check` runs the format check, the build, and the test suite locally.
-`make test-llvm` runs the same tests with the LLVM backend. CI runs both on
-ubuntu and macos.
+`make check` runs the format check, the build, and the test suite locally. It
+also compiles and runs the `sigaction` layout oracle in `ci/`, so it needs a
+host C compiler; `make check-abi` runs just that step. `make test-llvm` runs the
+same tests with the LLVM backend. CI runs both on ubuntu and macos.
 
 ## License
 
