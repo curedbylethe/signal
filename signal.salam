@@ -206,13 +206,17 @@ end
 /// owns the memory and releases it with mem.Free. Returns null on Windows,
 /// when the allocation fails, or when SIGWINCH cannot be added.
 pub func NewWinchSet(): void*:
-    set := NewSet()
-    if set == null: ret null end
-    if not AddSignal(set, WinchSignal):
-        mem.Free(set)
+    if SALAM_OS_WINDOWS:
         ret null
+    else:
+        set := NewSet()
+        if set == null: ret null end
+        if not AddSignal(set, WinchSignal):
+            mem.Free(set)
+            ret null
+        end
+        ret set
     end
-    ret set
 end
 
 @en "InstallWinchHandler"
@@ -222,7 +226,11 @@ end
 /// free it with mem.Free. Null on Windows and when the install fails, in
 /// which case nothing is left changed. A no-op on Windows.
 pub func InstallWinchHandler(): void*:
-    ret Install(WinchSignal, &_winch_noop)
+    if SALAM_OS_WINDOWS:
+        ret null
+    else:
+        ret Install(WinchSignal, &_winch_noop)
+    end
 end
 
 @en "Install"
