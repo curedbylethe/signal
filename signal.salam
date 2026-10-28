@@ -40,8 +40,8 @@
  * remove. Restore puts this thread's mask back above one reference and, at the
  * last one, puts back the state the first Install captured — disposition and
  * mask both, whichever order the handles are freed in — then frees the
- * canonical snapshot; at zero it re-applies the same state without changing a
- * count, so a repeated Restore is legal.
+ * canonical snapshot; at zero it does nothing and succeeds, because the state
+ * is already back and a handle's mask would undo it.
  * The mask half goes through pthread_sigmask, not sigprocmask, because
  * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
  * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
@@ -632,8 +632,8 @@ end
 /// last reference the state the *first* Install captured goes back in full —
 /// both the disposition and that mask — so freeing handles in either order
 /// leaves the signal unblocked. The registry then frees its canonical
-/// snapshot. At zero references the same state is re-applied without touching
-/// a count, so a repeated Restore is legal and succeeds again.
+/// snapshot. A further Restore does nothing and succeeds: the state is already
+/// back, and re-applying a handle would restore the mask it was taken with.
 /// Frees nothing the caller owns.
 pub func Restore(sig: int, prev: void*): bool:
     if SALAM_OS_WINDOWS:
@@ -682,9 +682,11 @@ pub func Restore(sig: int, prev: void*): bool:
             _ := sync.Unlock(_mu)
             ret ok
         end
-        // refs == 0: idempotent, no count change, nothing to free.
+        // refs == 0: the state went back at the last reference, so there is
+        // nothing left to apply. Re-applying this handle would be wrong: every
+        // copy made while the signal was owned carries the blocked mask.
         _ := sync.Unlock(_mu)
-        ret _put_back(sig, prev)
+        ret true
     end
 end
 

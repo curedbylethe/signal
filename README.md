@@ -156,7 +156,7 @@ end
 | `WaitTimeout` | `Wait` with a bound in milliseconds: `WaitTimedOut` when the bound wins and `out` untouched, `millis` 0 probes once, negative is `WaitInvalid`; one signal per call on Darwin, any set on Linux, `WaitInvalid` on the other POSIX targets |
 | `WaitWinch` | Park until `SIGWINCH` is queued and return its number, or a negative status; `0` on Windows only |
 | `WakeWinch` | Send `SIGWINCH` to this process to break the wait; false on Windows or when the call failed |
-| `Restore` | Put the captured state back: above one reference the calling thread's mask, at the last reference the first install's disposition and mask — either order leaves the signal unblocked — and after that the same state again without touching a count; false when the handle is null or a step failed |
+| `Restore` | Put the captured state back: above one reference the calling thread's mask, at the last reference the first install's disposition and mask — either order leaves the signal unblocked — and from then on a further call does nothing and succeeds; false when the handle is null or a step failed |
 
 ### Wait status
 
