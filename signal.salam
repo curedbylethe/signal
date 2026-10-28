@@ -34,6 +34,10 @@
  * never frees it, so a second Restore re-applies the same state instead of
  * reading freed memory. Handles nest: Install A then Install B must be
  * restored B then A, because B's snapshot already holds A's blocked mask.
+ * The mask half goes through pthread_sigmask, not sigprocmask, because
+ * sigprocmask is process-wide on Darwin and unspecified in a multithreaded
+ * process on Linux, so only pthread_sigmask makes "the calling thread's mask"
+ * true.
  * Install blocks the signal on the calling thread as its last step, after the
  * disposition is in place: a signal blocked while SIG_DFL is still installed
  * is discarded at generation on Darwin, so the other order loses it.
@@ -91,7 +95,7 @@ end
 if not SALAM_OS_WINDOWS:
     extern:
         func sigaction(sig: int, act: void*, old: void*): int
-        func sigprocmask(how: int, set: void*, old: void*): int
+        func pthread_sigmask(how: int, set: void*, old: void*): int
         func sigemptyset(set: void*): int
         func sigfillset(set: void*): int
         func sigaddset(set: void*, sig: int): int
@@ -251,7 +255,7 @@ pub func Install(sig: int, handler: void*): void*:
         // set == null only reads the mask into the third argument; how is
         // ignored then, on Darwin and on Linux alike.
         mask := ((handle as u64) + (_SIGACTION_SIZE as u64)) as void*
-        if sigprocmask(_SIG_BLOCK, null, mask) != 0:
+        if pthread_sigmask(_SIG_BLOCK, null, mask) != 0:
             mem.Free(handle)
             ret null
         end
@@ -432,7 +436,7 @@ pub func Block(set: void*): bool:
         ret false
     else:
         if set == null: ret false end
-        ret sigprocmask(_SIG_BLOCK, set, null) == 0
+        ret pthread_sigmask(_SIG_BLOCK, set, null) == 0
     end
 end
 
@@ -444,7 +448,7 @@ pub func Unblock(set: void*): bool:
         ret false
     else:
         if set == null: ret false end
-        ret sigprocmask(_SIG_UNBLOCK, set, null) == 0
+        ret pthread_sigmask(_SIG_UNBLOCK, set, null) == 0
     end
 end
 
@@ -456,7 +460,7 @@ pub func SetMask(set: void*): bool:
         ret false
     else:
         if set == null: ret false end
-        ret sigprocmask(_SIG_SETMASK, set, null) == 0
+        ret pthread_sigmask(_SIG_SETMASK, set, null) == 0
     end
 end
 
@@ -472,7 +476,7 @@ pub func CurrentMask(): void*:
         set := NewSet()
         if set == null: ret null end
         // set == null is what selects "read only"; how is ignored then.
-        if sigprocmask(_SIG_BLOCK, null, set) != 0:
+        if pthread_sigmask(_SIG_BLOCK, null, set) != 0:
             mem.Free(set)
             ret null
         end
