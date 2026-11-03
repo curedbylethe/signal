@@ -9,14 +9,15 @@ The package owns the process-wide handler and the blocked signal mask, and
 nothing else: no terminal state, no policy, no widget code.
 
 > **Status: early development.** `v0.1.1` shipped the signal-set API and
-> `v0.1.2` ships the disposition and wait API (`Install`, `Restore`, `Wait`,
+> `v0.1.2` shipped the disposition and wait API (`Install`, `Restore`, `Wait`,
 > `WaitTimeout`): one process-wide owner per signal, five explicit wait
-> statuses, and a bounded wait on both kernels. Windows is a documented stub.
+> statuses, and a bounded wait on both kernels. `v0.2.0` is the current
+> release: the same API, now requiring Salam 0.6.1. Windows is a documented stub.
 > Hardening is tracked separately.
 
 ## Install
 
-You need the Salam compiler, version 0.5.9 or later:
+You need the Salam compiler, version 0.6.1 or later:
 
 ```sh
 { curl -fsSL https://raw.githubusercontent.com/SalamLang/Salam/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/SalamLang/Salam/refs/heads/main/install.sh; } | sh
@@ -25,7 +26,7 @@ You need the Salam compiler, version 0.5.9 or later:
 Add signal with Salam's package manager:
 
 ```sh
-salam add github.com/curedbylethe/signal@v0.1.2
+salam add github.com/curedbylethe/signal@v0.2.0
 ```
 
 ## Usage
