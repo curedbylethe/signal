@@ -14,9 +14,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: SalamLang/Salam/.github/actions/setup-salam@d5e0c093c7e0d978bc5eae404fdeed4755d581d9  # v0.5.9
+      - uses: SalamLang/Salam/.github/actions/setup-salam@98396ba982a159a43eb8711ffa6b1adc1b65189b  # v0.6.1
         with:
-          version: '0.5.9'
+          version: '0.6.1'
       - run: salam version
       - run: make check
       - run: make test-llvm
@@ -55,9 +55,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: SalamLang/Salam/.github/actions/setup-salam@d5e0c093c7e0d978bc5eae404fdeed4755d581d9  # v0.5.9
+      - uses: SalamLang/Salam/.github/actions/setup-salam@98396ba982a159a43eb8711ffa6b1adc1b65189b  # v0.6.1
         with:
-          version: '0.5.9'
+          version: '0.6.1'
       - run: salam version
       # Compile only, never run: the exe reports WinchSupported() == false and
       # every POSIX assertion would fail. mkdir is ours because build/ is
