@@ -1,41 +1,44 @@
 # signal
 
-POSIX signal primitives for the [Salam](https://github.com/SalamLang/Salam)
-programming language: general POSIX signal sets plus the `SIGWINCH` listening
-plumbing extracted from
-[basalam](https://github.com/curedbylethe/basalam)'s resize watcher.
+`signal` provides POSIX signal sets, per-thread signal masks, and `SIGWINCH`
+install-and-wait support for the Salam programming language.
 
-The package owns the process-wide handler and the blocked signal mask, and
-nothing else: no terminal state, no policy, no widget code.
+> Early development. POSIX support is tested on Linux and macOS. Windows
+> compiles against a stub and has no `SIGWINCH` support.
 
-> **Status: early development.** `v0.1.1` shipped the signal-set API and
-> `v0.1.2` shipped the disposition and wait API (`Install`, `Restore`, `Wait`,
-> `WaitTimeout`): one process-wide owner per signal, five explicit wait
-> statuses, and a bounded wait on both kernels. `v0.2.0` is the current
-> release: the same API, now requiring Salam 0.6.1. Windows is a documented stub.
-> Hardening is tracked separately.
+## Features
+
+- Wait for `SIGWINCH` without polling.
+- Use bounded waits with explicit result statuses.
+- Create signal sets and control the calling thread's signal mask.
+- Install and restore signal handlers with shared ownership.
+- Compile Windows consumers against safe stub functions.
 
 ## Install
 
-You need the Salam compiler, version 0.6.1 or later:
+Install Salam 0.6.1 or later using the [Salam installation instructions](https://github.com/SalamLang/Salam).
+
+If your project does not have a Salam manifest, create one:
 
 ```sh
-{ curl -fsSL https://raw.githubusercontent.com/SalamLang/Salam/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/SalamLang/Salam/refs/heads/main/install.sh; } | sh
+salam init
 ```
 
-Add signal with Salam's package manager:
+Add `signal` to your project:
 
 ```sh
 salam add github.com/curedbylethe/signal@v0.2.0
 ```
 
-## Usage
+Commit `salam.toml` and `salam.lock` with your project.
 
-### SIGWINCH
+## Quick start
+
+This program waits for `SIGWINCH` and prints when the terminal sends a resize
+signal. `WaitWinch` parks until a resize signal arrives.
 
 ```salam
 import mem
-
 import "github.com/curedbylethe/signal"
 
 func main:
@@ -43,89 +46,47 @@ func main:
         ret
     end
 
-    // Install snapshots the disposition and the mask, gives SIGWINCH its
-    // handler, then blocks it: a signal blocked while its disposition is still
-    // SIG_DFL would be discarded at generation on Darwin, so the order is the
-    // function's job, not the caller's.
     prev := signal.InstallWinchHandler()
+    if prev == null:
+        ret
+    end
     defer mem.Free(prev)
     defer signal.Restore(signal.WinchSignal, prev)
 
     set := signal.NewWinchSet()
+    if set == null:
+        ret
+    end
     defer mem.Free(set)
 
-    // The out-block is caller-owned and written on arrival only, so its
-    // previous value survives every other status. 4 bytes hold the i32 number.
-    out := mem.AllocateZeroed(4 as u64)
-    if out == null: ret end
-    defer mem.Free(out)
-
-    // Branch on the status, not on the signal number: 0 from WaitTimeout means
-    // the bound expired, and only that.
-    mut running := true
-    until running:
-        status := signal.WaitTimeout(set, out, 500)
-        if status == signal.WaitArrived:
-            // out[0] holds the signal number, not the size: re-read the size.
-            println "the terminal may have resized"
-        else if status == signal.WaitTimedOut:
-            // Nothing arrived inside the bound, so the loop gets control back
-            // without another thread having to wake it.
-            println "nothing arrived in 500 ms"
-        else:
-            // WaitBusy, WaitInvalid or WaitFailed: nothing was waited on, so
-            // stop instead of spinning on a broken wait.
-            running = false
-        end
+    if signal.WaitWinch(set) == signal.WinchSignal:
+        println "terminal resized"
     end
 end
 ```
 
-`WaitWinch` is the same wait specialised to `SIGWINCH`: it takes the set and
-returns the signal number on arrival, `WaitInvalid` (`-1`), `WaitFailed`
-(`-2`) or `WaitBusy` (`-3`) otherwise, and `0` on Windows only, where there is
-no `SIGWINCH`. Never compare a wait against `0` to test whether it worked: `0`
-means "timed out" from `WaitTimeout` and "Windows" from `WaitWinch`, and `Wait`
-never returns it.
+## Usage
 
-A handler passed to `Install` runs on the thread that took the signal, so it
-may call async-signal-safe functions only: no allocation, no locks, no stdio,
-no calls into the Salam runtime. Touching only `volatile sig_atomic_t`,
-lock-free atomics or read-only data is safe. It must also save `errno` on
-entry and restore it before returning. `InstallWinchHandler` supplies the
-package's no-op handler, which meets the contract by doing nothing. `Wait` and
-`WaitTimeout` allocate nothing at all: the registry, the Darwin kqueue and the
-timespec buffer are all built by `Install`.
+### SIGWINCH and waits
 
-`Install`, `Restore` and the waits share one process-wide owner: the first
-install of a handler does the work, a later install of the same handler only
-refcounts, and a later install of a *different* handler is refused with null —
-a handler that never runs is the failure this package exists to prevent. Each
-`Install` returns a caller-owned copy, so both consumers can free what they
-were given; a `Restore` above the last reference only drops the count, so the
-signal stays blocked while any consumer still owns it, and the last `Restore`
-puts the first install's disposition and mask back, whichever order the handles
-are freed in. One
-waiter at a time, too: a second concurrent `Wait` or `WaitTimeout` returns
-`WaitBusy` rather than silently receiving a subset of the deliveries, so a
-consumer retries instead of splitting them.
+`Wait` waits without a time limit. `WaitTimeout` waits for a bounded time and
+requires a prior `Install`; on Darwin, each timed wait accepts exactly one
+signal, while Linux accepts any set. Block signals on the calling thread before
+waiting; `InstallWinchHandler` blocks `SIGWINCH` for you. After installation,
+only one process-wide wait can run at a time; a concurrent wait returns
+`WaitBusy`.
 
-### Windows
-
-Windows has no `SIGWINCH` and no `sigset_t`, so the surface is a documented
-stub: `WinchSupported()` is false, `Wait` and `WaitTimeout` return
-`WaitInvalid` (`-1`) without waiting, `Install` returns null, `Restore`
-returns false, the set functions return null or fail, and `WaitWinch` returns
-`0`. Every function is still safe to call, so the same consumer compiles
-there. A consumer that wants resizes on Windows keeps polling the terminal
-size — `sys.Size()` or `term.Size()` — every 20 ms instead of installing a
-handler.
+The wait statuses are `WaitArrived` (`1`), `WaitTimedOut` (`0`), `WaitInvalid`
+(`-1`), `WaitFailed` (`-2`), and `WaitBusy` (`-3`). `WaitWinch` is a specialized
+wait for `SIGWINCH` that returns the signal number or a negative status.
 
 ### Signal sets
 
+Create a set, add signal numbers, check membership, and change the calling
+thread's mask:
+
 ```salam
 import mem
-
 import "github.com/curedbylethe/signal"
 
 func main:
@@ -137,95 +98,38 @@ func main:
 
     if signal.IsSignal(set, 15):
         _ := signal.Block(set)
-        // A sigwait on the set now covers both signals.
         _ := signal.Unblock(set)
     end
 end
 ```
 
-## API
+### Windows
 
-### SIGWINCH
+Windows has no `SIGWINCH`. `WinchSupported()` is false, `Install` returns
+`null`, `Wait` and `WaitTimeout` return `WaitInvalid`, and `WaitWinch` returns
+`0`. For resize detection, poll `term.Size()` every 20 ms.
 
-| Name | Purpose |
-|---|---|
-| `WinchSignal` | The `SIGWINCH` number, 28 on macOS and Linux |
-| `WinchSupported` | True on POSIX, false on the Windows stub surface |
-| `NewWinchSet` | Allocate a caller-owned signal set holding only `SIGWINCH` |
-| `Install` | Capture the disposition and mask, install `handler`, block `sig`; installs once and refcounts after that, refuses a different handler with null, and returns a caller-owned handle |
-| `InstallWinchHandler` | Install the package no-op handler and block; returns a caller-owned copy of the previous state |
-| `BlockWinch` | Add `SIGWINCH` to the calling thread's mask; false on Windows or when the call failed |
-| `Wait` | Park until a signal in the set is queued; write its number to `out` and return `WaitArrived`, or `WaitInvalid`, `WaitFailed` or `WaitBusy`; never times out |
-| `WaitTimeout` | `Wait` with a bound in milliseconds: `WaitTimedOut` when the bound wins and `out` untouched, `millis` 0 probes once, negative is `WaitInvalid`; one signal per call on Darwin, any set on Linux, `WaitInvalid` on the other POSIX targets |
-| `WaitWinch` | Park until `SIGWINCH` is queued and return its number, or a negative status; `0` on Windows only |
-| `WakeWinch` | Send `SIGWINCH` to this process to break the wait; false on Windows or when the call failed |
-| `Restore` | Drop a reference: above the last one nothing else changes, so the signal stays blocked while anyone owns it; at the last one the first install's disposition and mask go back, either order; after that a further call does nothing and succeeds; false when the handle is null or a step failed |
+## Common problems
 
-### Wait status
+- Windows has no `SIGWINCH`; poll `term.Size()` every 20 ms for resize changes.
+- Block a signal on the calling thread before waiting. `InstallWinchHandler`
+  blocks `SIGWINCH` during installation.
+- After `Install`, another concurrent waiter receives `WaitBusy`.
+- Before any install, `WaitTimeout` returns `WaitInvalid`.
+- A custom handler must call only async-signal-safe functions, save `errno` on
+  entry, and restore it before returning.
+- Darwin's `WaitTimeout` accepts exactly one signal in its set per call.
+- `WaitTimedOut` is `0`, not success; `WaitWinch` returns `0` only on Windows.
+- `WaitTimeout` needs a prior `Install` to create its wait state.
+- Standard signals can coalesce, so repeated raises may produce one pending
+  signal rather than one notification per event.
 
-| Name | Value | Meaning |
-|---|---|---|
-| `WaitArrived` | `1` | A signal from the set arrived; `out` holds its number |
-| `WaitTimedOut` | `0` | The bound expired and `out` was not written; only `WaitTimeout` returns it |
-| `WaitInvalid` | `-1` | A bad argument, a target with no bounded wait, or Windows; nothing was waited on |
-| `WaitFailed` | `-2` | The wait itself failed; `out` is untouched |
-| `WaitBusy` | `-3` | Another thread in this process already owns the wait; nothing was waited on |
+## Documentation
 
-`Install` takes a handler of your own: pass `&handler`, and that handler owes
-the async-signal-safety contract above. Hand the returned handle to `Restore`
-on the way out and release it with `mem.Free`.
-
-### Signal sets
-
-| Name | Purpose |
-|---|---|
-| `SignalSetSize` | Bytes in a platform signal set: 4 on macOS and OpenBSD, 16 on FreeBSD and NetBSD, 128 on Linux, 0 on Windows |
-| `NewSet` | Allocate an empty caller-owned set |
-| `FillSet` | Add every signal to a set |
-| `AddSignal` | Add one signal number; false when the number is invalid or unsupported |
-| `DelSignal` | Remove one signal number; false when the number is invalid or unsupported |
-| `IsSignal` | True when the set contains the number |
-| `Block` | Block every signal in the set on the calling thread; false when `set` is null or the mask could not be changed |
-| `Unblock` | Unblock every signal in the set on the calling thread; false when `set` is null or the mask could not be changed |
-| `SetMask` | Replace the calling thread's mask with the set; false when `set` is null or the mask could not be changed |
-| `CurrentMask` | Copy of the calling thread's mask; caller frees |
-
-Every POSIX target installs the disposition through `sigaction`, never
-`signal()`: Darwin, Linux, FreeBSD, NetBSD and OpenBSD. The `struct sigaction`
-is a zeroed block written through per-target offsets inside `signal.salam`;
-only `SA_RESTART` is set and `sa_mask` stays empty, so a syscall interrupted by
-a delivered signal restarts. `ci/sigaction_offsets.c` proves those offsets with
-`_Static_assert`s against each platform's real headers and a `sigaction` round
-trip, and CI runs it in a job per BSD. Salam has no BSD port, so the BSD
-branches are proven by that oracle and reviewed, not compiled by this package.
-
-CI builds and tests this package on macOS and Linux with both backends. The
-`windows-compile` job builds `ci/windows_compile.salam` on `windows-latest` and
-never runs it: it names every public symbol so a Windows body that reached for
-a POSIX extern fails to compile. That job proves the stub compiles, not that it
-waits. DragonFly is not a Salam target. The signal-set API is part of
-`v0.1.1`; everything below `Install` is `v0.1.2`.
-
-## Contributing
-
-`make check` runs the format check, the build, and the test suite locally. It
-also compiles and runs the `sigaction` layout oracle in `ci/`, so it needs a
-host C compiler; `make check-abi` runs just that step. `make test-llvm` runs the
-same tests with the LLVM backend. CI runs both on ubuntu and macos.
-
-Four rules this repository enforces:
-
-1. `salam format` is the authority. `make check` fails on unformatted source,
-   so run `make format` rather than hand-wrapping.
-2. Four-space indent and 100 columns, including comments; the formatter
-   enforces both and CI checks them.
-3. Commit messages are Conventional Commits: `feat:`, `fix:`, `test:`, `ci:`,
-   `docs:`, with an optional scope such as `feat(signal):`.
-4. Every test is `tests/<name>.salam` plus a `tests/<name>.out` golden holding
-   its exact stdout, and `main` ends with `ret testing.Summary()`. Tests never
-   read the terminal and may not sleep longer than the runner's watchdog.
+- [API reference](docs/reference.md)
+- [Design and platform contracts](docs/design.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 
-GPL-3.0-or-later, the same license family as Salam itself. See
-[LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
